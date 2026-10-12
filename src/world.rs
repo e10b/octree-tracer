@@ -1,11 +1,22 @@
 use super::*;
 use dashmap::{DashMap, DashSet};
+use std::collections::HashMap;
 use std::sync::Arc;
 
 pub struct World {
     pub path: String,
     pub chunks: Arc<DashMap<u32, CpuOctree>>,
     pub loading: Arc<DashSet<u32>>,
+    /// Terrain sections are generated on demand instead of read from disk.
+    pub procedural_chunks: bool,
+    pub loads_this_frame: usize,
+    pub load_budget: usize,
+    /// Chunk coordinate of the octree corner at (-1, -1, -1).
+    pub window_origin: (i32, i32, i32),
+    block_colors: [Voxel; 9],
+    coord_to_id: HashMap<(i32, i32, i32), u32>,
+    id_to_coord: HashMap<u32, (i32, i32, i32)>,
+    next_stream_id: u32,
 }
 
 impl World {
@@ -14,6 +25,14 @@ impl World {
             path,
             chunks: Arc::new(DashMap::new()),
             loading: Arc::new(DashSet::new()),
+            procedural_chunks: false,
+            loads_this_frame: 0,
+            load_budget: 8,
+            window_origin: (0, 0, 0),
+            block_colors: [Voxel::new(0, 0, 0); 9],
+            coord_to_id: HashMap::new(),
+            id_to_coord: HashMap::new(),
+            next_stream_id: STREAM_BASE,
         };
 
         world.chunks.insert(
@@ -58,6 +77,137 @@ impl World {
         world.generate_mip_tree(8);
 
         world
+    }
+
+    /// Infinite block world. The raytracer sees one window of sections; the window
+    /// recenters when you fly toward its edge, so chunk coordinates never run out.
+    pub fn minecraft() -> Self {
+        let mut world = Self::new(String::new());
+        world.procedural_chunks = true;
+
+        for id in 1..=8 {
+            world.block_colors[id as usize] = world.chunks.get(&id).unwrap().top_mip;
+        }
+
+        let spawn = spawn_blocks();
+        let origin = window_origin_for_chunk(
+            (spawn.x).div_euclid(BLOCKS_PER_CHUNK as f32) as i32,
+            (spawn.y).div_euclid(BLOCKS_PER_CHUNK as f32) as i32,
+            (spawn.z).div_euclid(BLOCKS_PER_CHUNK as f32) as i32,
+        );
+        world.place_window(origin);
+        let sections = world
+            .chunks
+            .get(&0)
+            .unwrap()
+            .nodes
+            .iter()
+            .filter(|n| n.pointer > CHUNK_OFFSET)
+            .count();
+        println!(
+            "Infinite block world: tracing a {WINDOW_CHUNKS}³ chunk window ({sections} sections of {BLOCKS_PER_CHUNK}³ in view, more generate as you fly)"
+        );
+        world
+    }
+
+    pub fn ensure_chunk_id(&mut self, cx: i32, cy: i32, cz: i32) -> u32 {
+        if let Some(id) = self.coord_to_id.get(&(cx, cy, cz)) {
+            return *id;
+        }
+        let id = self.next_stream_id;
+        self.next_stream_id += 1;
+        self.coord_to_id.insert((cx, cy, cz), id);
+        self.id_to_coord.insert(id, (cx, cy, cz));
+        id
+    }
+
+    /// Point the traced cube at chunks starting at `origin`. Section data already
+    /// in memory is kept; sections that fell outside the window are dropped.
+    pub fn place_window(&mut self, origin: (i32, i32, i32)) {
+        self.window_origin = origin;
+        let mut root = CpuOctree::new(0);
+        let mut keep = Vec::new();
+        for ly in 0..WINDOW_CHUNKS {
+            for lx in 0..WINDOW_CHUNKS {
+                for lz in 0..WINDOW_CHUNKS {
+                    let cx = origin.0 + lx;
+                    let cy = origin.1 + ly;
+                    let cz = origin.2 + lz;
+                    let Some(kind) = chunk_kind(cx, cy, cz) else {
+                        continue;
+                    };
+                    let id = self.ensure_chunk_id(cx, cy, cz);
+                    keep.push(id);
+                    let pos = chunk_center(lx, ly, lz);
+                    root.put_in_block(pos, id, WINDOW_DEPTH);
+                    let (node, _, _) = root.find_voxel(pos, None);
+                    root.nodes[node].value = self.block_colors[kind as usize];
+                }
+            }
+        }
+
+        let keep_coords: Vec<(i32, i32, i32)> = keep
+            .iter()
+            .filter_map(|id| self.id_to_coord.get(id).copied())
+            .collect();
+        self.chunks.retain(|k, _| *k < STREAM_BASE || keep.contains(k));
+        self.coord_to_id
+            .retain(|coord, _| keep_coords.contains(coord));
+        self.id_to_coord
+            .retain(|_, coord| keep_coords.contains(coord));
+
+        self.chunks.insert(0, root);
+        self.generate_mip_tree(0);
+    }
+
+    /// If the camera has walked out of the middle of the traced cube, slide the
+    /// cube so that world position stays put and new chunks come into range.
+    /// Returns the camera position in the new cube.
+    pub fn recenter(&mut self, octree_pos: Point3<f32>) -> Option<Point3<f32>> {
+        if !self.procedural_chunks {
+            return None;
+        }
+        let blocks = octree_to_blocks(
+            Vector3::new(octree_pos.x, octree_pos.y, octree_pos.z),
+            self.window_origin,
+        );
+        let cx = blocks.x.div_euclid(BLOCKS_PER_CHUNK as f32) as i32;
+        let cy = blocks.y.div_euclid(BLOCKS_PER_CHUNK as f32) as i32;
+        let cz = blocks.z.div_euclid(BLOCKS_PER_CHUNK as f32) as i32;
+        let lx = cx - self.window_origin.0;
+        let ly = cy - self.window_origin.1;
+        let lz = cz - self.window_origin.2;
+        let margin = WINDOW_CHUNKS / 4;
+        let inside = lx >= margin
+            && lx < WINDOW_CHUNKS - margin
+            && ly >= margin
+            && ly < WINDOW_CHUNKS - margin
+            && lz >= margin
+            && lz < WINDOW_CHUNKS - margin;
+        if inside {
+            return None;
+        }
+
+        let origin = window_origin_for_chunk(cx, cy, cz);
+        self.place_window(origin);
+        let shifted = blocks_to_octree(blocks, origin);
+        Some(Point3::new(shifted.x, shifted.y, shifted.z))
+    }
+
+    pub fn chunk_at_octree_pos(&self, octree_pos: Point3<f32>) -> (i32, i32, i32) {
+        let blocks = octree_to_blocks(
+            Vector3::new(octree_pos.x, octree_pos.y, octree_pos.z),
+            self.window_origin,
+        );
+        (
+            blocks.x.div_euclid(BLOCKS_PER_CHUNK as f32) as i32,
+            blocks.y.div_euclid(BLOCKS_PER_CHUNK as f32) as i32,
+            blocks.z.div_euclid(BLOCKS_PER_CHUNK as f32) as i32,
+        )
+    }
+
+    pub fn terrain_chunk_count(&self) -> usize {
+        self.chunks.iter().filter(|e| *e.key() >= STREAM_BASE).count()
     }
 
     pub fn generate_world<S: AsRef<std::ffi::OsStr> + Sized>(
@@ -180,9 +330,43 @@ impl World {
         file.write_all(data).unwrap();
     }
 
-    pub fn load_chunk(&mut self, index: u32) {
+    pub fn load_chunk(&mut self, index: u32) -> bool {
+        if self.chunks.contains_key(&index) {
+            return true;
+        }
+
+        if self.procedural_chunks && index >= STREAM_BASE {
+            if self.loads_this_frame >= self.load_budget {
+                return false;
+            }
+            self.loads_this_frame += 1;
+
+            let Some((cx, cy, cz)) = self.id_to_coord.get(&index).copied() else {
+                return false;
+            };
+            let chunk = generate_block_chunk(cx, cy, cz);
+            self.chunks.insert(index, chunk);
+            self.generate_mip_tree(index);
+
+            let top = self.chunks.get(&index).unwrap().top_mip;
+            let lx = cx - self.window_origin.0;
+            let ly = cy - self.window_origin.1;
+            let lz = cz - self.window_origin.2;
+            if top != Voxel::new(0, 0, 0)
+                && (0..WINDOW_CHUNKS).contains(&lx)
+                && (0..WINDOW_CHUNKS).contains(&ly)
+                && (0..WINDOW_CHUNKS).contains(&lz)
+            {
+                let pos = chunk_center(lx, ly, lz);
+                if let Some((0, node, _, _)) = self.find_voxel(pos, Some(WINDOW_DEPTH)) {
+                    self.chunks.get_mut(&0).unwrap().nodes[node].value = top;
+                }
+            }
+            return true;
+        }
+
         if self.loading.contains(&index) {
-            return;
+            return false;
         }
         self.loading.insert(index);
 
@@ -195,14 +379,15 @@ impl World {
             chunks.insert(index, root);
             loading.remove(&index);
         });
+        false
     }
 
-    /// Returns (chunk, index, depth, pos)
+    /// Returns (chunk, index, depth, pos). None if a chunk on the path is not resident.
     pub fn find_voxel(
         &self,
         pos: Vector3<f32>,
         max_depth: Option<u32>,
-    ) -> (u32, usize, u32, Vector3<f32>) {
+    ) -> Option<(u32, usize, u32, Vector3<f32>)> {
         let mut node_index = 0;
         let mut chunk = 0;
         let mut node_pos = Vector3::zero();
@@ -219,9 +404,12 @@ impl World {
 
             node_pos += Octree::pos_offset(child_index, depth);
 
-            let tnipt = self.chunks.get(&chunk).unwrap().nodes[node_index + child_index].pointer;
+            let tnipt = {
+                let nodes = self.chunks.get(&chunk)?;
+                nodes.nodes.get(node_index + child_index)?.pointer
+            };
             if tnipt == CHUNK_OFFSET || depth == max_depth.unwrap_or(u32::MAX) {
-                return (chunk, node_index + child_index, depth, node_pos);
+                return Some((chunk, node_index + child_index, depth, node_pos));
             } else if tnipt > CHUNK_OFFSET {
                 chunk = tnipt - CHUNK_OFFSET;
                 node_index = 0;
@@ -249,17 +437,16 @@ impl World {
                 queue.push_back((child_index, 1));
             } else if node.pointer > CHUNK_OFFSET {
                 let index = node.pointer - CHUNK_OFFSET;
-                self.chunks.get_mut(&id).unwrap().nodes[child_index].value =
-                    self.chunks.get(&index).unwrap().top_mip;
+                if let Some(top_mip) = self.chunks.get(&index).map(|c| c.top_mip) {
+                    self.chunks.get_mut(&id).unwrap().nodes[child_index].value = top_mip;
+                }
             }
         }
-
-        println!("Staring to mip...");
 
         let mut i = 0;
         while let Some((node_index, depth)) = queue.pop_front() {
             loop {
-                if i % 1000000 == 0 {
+                if i > 0 && i % 1000000 == 0 {
                     println!("Cataloged {} million nodes", i / 1000000);
                 }
                 i += 1;
@@ -275,10 +462,11 @@ impl World {
                             queue.push_back((node.pointer as usize + child_index, depth + 1));
                         } else if child_node.pointer > CHUNK_OFFSET {
                             let index = child_node.pointer - CHUNK_OFFSET;
-                            let top_mip = self.chunks.get(&index).unwrap().top_mip;
-                            self.chunks.get_mut(&id).unwrap().nodes
-                                [node.pointer as usize + child_index]
-                                .value = top_mip;
+                            if let Some(top_mip) = self.chunks.get(&index).map(|c| c.top_mip) {
+                                self.chunks.get_mut(&id).unwrap().nodes
+                                    [node.pointer as usize + child_index]
+                                    .value = top_mip;
+                            }
                         }
                     }
 
@@ -316,6 +504,9 @@ impl World {
                     }
                 }
 
+                if divisor == 0.0 {
+                    continue;
+                }
                 colour /= divisor;
 
                 let voxel = Voxel::new(
@@ -331,7 +522,94 @@ impl World {
                 }
             }
         }
+    }
+}
 
-        println!("Mip success!");
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn view_ray_reaches_the_block_model() {
+        let mut world = World::minecraft();
+
+        let mask = world.chunks.get(&0).unwrap().get_node_mask(0);
+        assert!(mask.iter().any(|v| *v != Voxel::new(0, 0, 0)));
+        let mut octree = Octree::new(mask);
+        let (spawn, _) = player_start(world.window_origin);
+        prime_view(
+            &mut octree,
+            &mut world,
+            Vector3::new(spawn.x, spawn.y, spawn.z),
+            6,
+        );
+        assert!(octree.nodes.len() > 8);
+        assert!(world.terrain_chunk_count() > 0);
+
+        let check = |world: &mut World, x: i32, z: i32| {
+            let h = terrain_height(x, z);
+            let origin = window_origin_for_chunk(
+                chunk_of_block(x),
+                chunk_of_block(h),
+                chunk_of_block(z),
+            );
+            world.place_window(origin);
+            for (wy, expect) in [(h, GRASS), (h - 1, DIRT), (h - 5, STONE)] {
+                let pos = block_window_pos(x, wy, z, origin);
+                let section = world.ensure_chunk_id(
+                    chunk_of_block(x),
+                    chunk_of_block(wy),
+                    chunk_of_block(z),
+                );
+
+                let (chunk, index, depth, _) = world.find_voxel(pos, Some(WINDOW_DEPTH)).unwrap();
+                assert_eq!(chunk, 0, "section pointer lives on the root");
+                assert_eq!(depth, WINDOW_DEPTH);
+                let pointer = world.chunks.get(&0).unwrap().nodes[index].pointer;
+                assert_eq!(pointer - CHUNK_OFFSET, section);
+
+                assert!(world.load_chunk(section));
+                let (chunk, index, depth, _) = world
+                    .find_voxel(pos, Some(WINDOW_DEPTH + CHUNK_DEPTH))
+                    .unwrap();
+                assert_eq!(depth, WINDOW_DEPTH + CHUNK_DEPTH);
+                let node = world.chunks.get(&chunk).unwrap().nodes[index];
+                assert_eq!(node.pointer, CHUNK_OFFSET + expect, "({x}, {wy}, {z})");
+                assert_ne!(node.value, Voxel::new(0, 0, 0));
+
+                let (model, index, depth, _) = world.find_voxel(pos, None).unwrap();
+                assert_eq!(model, expect);
+                assert!(depth > WINDOW_DEPTH + CHUNK_DEPTH);
+                let leaf = world.chunks.get(&model).unwrap().nodes[index];
+                assert_eq!(leaf.pointer, CHUNK_OFFSET);
+            }
+        };
+
+        check(&mut world, 128, 90);
+        check(&mut world, -80, 40);
+        check(&mut world, 0, 0);
+    }
+
+    #[test]
+    fn sliding_the_window_keeps_the_same_world_position() {
+        let mut world = World::minecraft();
+        let blocks = spawn_blocks() + Vector3::new(48.0, 0.0, -32.0);
+        let octree_pos = blocks_to_octree(blocks, world.window_origin);
+        let shifted = world
+            .recenter(Point3::new(octree_pos.x, octree_pos.y, octree_pos.z))
+            .expect("flying two chunks over should slide the window");
+        let back = octree_to_blocks(
+            Vector3::new(shifted.x, shifted.y, shifted.z),
+            world.window_origin,
+        );
+        assert!((back.x - blocks.x).abs() < 0.01);
+        assert!((back.y - blocks.y).abs() < 0.01);
+        assert!((back.z - blocks.z).abs() < 0.01);
+
+        let h = terrain_height(blocks.x as i32, blocks.z as i32);
+        let pos = block_window_pos(blocks.x as i32, h, blocks.z as i32, world.window_origin);
+        let (chunk, _, depth, _) = world.find_voxel(pos, Some(WINDOW_DEPTH)).unwrap();
+        assert_eq!(chunk, 0);
+        assert_eq!(depth, WINDOW_DEPTH);
     }
 }

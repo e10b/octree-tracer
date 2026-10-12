@@ -188,7 +188,14 @@ impl Render {
         }
     }
 
-    pub fn update(&mut self, gpu: &Gpu, time: f64, settings: &mut Settings, character: &Character) {
+    pub fn update(
+        &mut self,
+        gpu: &Gpu,
+        time: f64,
+        settings: &mut Settings,
+        character: &Character,
+        terrain_origin: Option<[f32; 3]>,
+    ) {
         let dimensions = [self.size.width as f32, self.size.height as f32];
 
         let view = Matrix4::<f32>::look_at_rh(
@@ -201,7 +208,14 @@ impl Render {
         let camera = proj * view;
         let camera_inverse = camera.invert().unwrap();
 
-        self.uniforms.dimensions = [dimensions[0], dimensions[1], 0.0, 0.0];
+        // dimensions.zw and sun_dir.w carry the block-space corner of the traced cube
+        // so the shader can continue a ray onto the height sheet. NaN disables it.
+        let (ox, oy, oz) = match terrain_origin {
+            Some([x, y, z]) => (x, y, z),
+            None => (0.0, f32::NAN, 0.0),
+        };
+        self.uniforms.dimensions = [dimensions[0], dimensions[1], ox, oz];
+        self.uniforms.sun_dir[3] = oy;
         self.uniforms.camera = camera.into();
         self.uniforms.camera_inverse = camera_inverse.into();
 
@@ -309,11 +323,11 @@ impl Uniforms {
             camera: [[0.0; 4]; 4],
             camera_inverse: [[0.0; 4]; 4],
             dimensions: [0.0, 0.0, 0.0, 0.0],
-            sun_dir: [-1.7, -1.0, 0.8, 0.0],
+            sun_dir: [-1.7, -1.0, 0.8, f32::NAN],
             pause_adaptive: false,
             show_steps: false,
             show_hits: false,
-            shadows: true,
+            shadows: false,
             misc_value: 0.0,
             misc_bool: false,
             junk: [0; 8],

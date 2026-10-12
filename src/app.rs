@@ -18,7 +18,7 @@ pub struct App {
 impl App {
     pub async fn new(window: &Window) -> Self {
         let input = Input::new();
-        let character = Character::new();
+        let mut character = Character::new();
 
         let settings = Settings {
             octree_depth: 12,
@@ -29,11 +29,11 @@ impl App {
         let gpu = Gpu::new(window).await;
         let procedural = Procedural::new(&gpu);
 
-        // let world = World::load_world("worlds/defualt").unwrap();
-        let mut world = World::new(String::new());
-        let chunk = CpuOctree::load_file("files/statuette.rsvo".to_string(), 10).unwrap();
-        world.chunks.insert(0, chunk);
-        world.generate_mip_tree(0);
+        let mut world = World::minecraft();
+        let (spawn, look) = player_start(world.window_origin);
+        character.pos = spawn;
+        character.look = look;
+        character.speed = -5.5;
 
         let gen_settings = GenSettings::default();
         // let cpu_octree = generate_world(&gen_settings, &blocks).unwrap();
@@ -45,7 +45,13 @@ impl App {
 
         // let octree = Octree::new([Voxel::new(255, 255, 255); 8]);
         let mask = world.chunks.get(&0).unwrap().get_node_mask(0);
-        let octree = Octree::new(mask);
+        let mut octree = Octree::new(mask);
+        prime_view(
+            &mut octree,
+            &mut world,
+            Vector3::new(character.pos.x, character.pos.y, character.pos.z),
+            6,
+        );
 
         let render = Render::new(&gpu, window, &octree).await;
         let compute = Compute::new(&gpu, &render);
@@ -70,17 +76,37 @@ impl App {
     pub fn update(&mut self, time: f64) {
         self.gui(time);
 
+        let boost = if self.input.boost { 10.0 } else { 1.0 };
         let input = Vector3::new(
             self.input.right as u32 as f32 - self.input.left as u32 as f32,
             self.input.up as u32 as f32 - self.input.down as u32 as f32,
             self.input.forward as u32 as f32 - self.input.backward as u32 as f32,
-        ) * std::f32::consts::E.powf(self.character.speed);
+        ) * std::f32::consts::E.powf(self.character.speed)
+            * boost;
 
         let forward: Vector3<f32> = self.character.look.normalize();
         let right = forward.cross(Vector3::unit_y()).normalize();
         let up = right.cross(forward);
 
         self.character.pos += forward * input.z + right * input.x + up * input.y;
+
+        if let Some(pos) = self.world.recenter(self.character.pos) {
+            self.character.pos = pos;
+            let mask = self.world.chunks.get(&0).unwrap().get_node_mask(0);
+            self.octree = Octree::new(mask);
+            prime_view(
+                &mut self.octree,
+                &mut self.world,
+                Vector3::new(pos.x, pos.y, pos.z),
+                6,
+            );
+            let nodes = self.octree.raw_data();
+            self.gpu.queue.write_buffer(
+                &self.render.node_buffer,
+                0,
+                bytemuck::cast_slice(&nodes),
+            );
+        }
 
         if self.character.cursour_grabbed {
             let delta = self.settings.sensitivity * self.input.mouse_delta * self.settings.fov;
@@ -91,8 +117,18 @@ impl App {
             self.character.look = (rotation * self.character.look).normalize();
         }
 
+        let terrain_origin = if self.world.procedural_chunks {
+            let origin = self.world.window_origin;
+            Some([
+                (origin.0 * BLOCKS_PER_CHUNK) as f32,
+                (origin.1 * BLOCKS_PER_CHUNK) as f32,
+                (origin.2 * BLOCKS_PER_CHUNK) as f32,
+            ])
+        } else {
+            None
+        };
         self.render
-            .update(&self.gpu, time, &mut self.settings, &self.character);
+            .update(&self.gpu, time, &mut self.settings, &self.character, terrain_origin);
 
         if !self.render.uniforms.pause_adaptive {
             self.compute.update(&self.gpu, &self.octree);
@@ -151,6 +187,7 @@ impl App {
                                     self.settings.octree_depth,
                                 ) {
                                     Ok(chunk) => {
+                                        self.world.procedural_chunks = false;
                                         self.world.chunks.remove(&0);
                                         self.world.chunks.insert(0, chunk);
                                         self.world.generate_mip_tree(0);
@@ -293,6 +330,15 @@ impl App {
                         self.octree.nodes.len() as f32 / 1000000.0,
                         hole_percentage,
                     ));
+                    if self.world.procedural_chunks {
+                        let (cx, cy, cz) = self.world.chunk_at_octree_pos(self.character.pos);
+                        ui.label(format!("Chunk: {cx}, {cy}, {cz}"));
+                        ui.label(format!(
+                            "Sections in memory: {} ({}³ blocks each)",
+                            self.world.terrain_chunk_count(),
+                            BLOCKS_PER_CHUNK,
+                        ));
+                    }
                 });
 
             egui::CollapsingHeader::new("Character")
@@ -378,6 +424,9 @@ impl App {
                     }
                     Some(VirtualKeyCode::LShift) => {
                         self.input.down = *state == ElementState::Pressed;
+                    }
+                    Some(VirtualKeyCode::Z) => {
+                        self.input.boost = *state == ElementState::Pressed;
                     }
                     //
                     Some(VirtualKeyCode::Escape) => {

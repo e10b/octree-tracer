@@ -28,6 +28,12 @@ var<storage, read_write> n: U32s; // nodes
 
 
 let VOXEL_OFFSET = 134217728u;
+// Block span of the traced cube. Matches WINDOW_CHUNKS * BLOCKS_PER_CHUNK.
+let WINDOW_SPAN = 128.0;
+// Euclidean bound on the slope of terrain_surface. Matches TERRAIN_MAX_SLOPE.
+let TERRAIN_MAX_SLOPE = 1.05;
+// Highest crest: 72 + 6 + 6 + 14 + 10. Matches TERRAIN_MAX_HEIGHT.
+let TERRAIN_MAX_HEIGHT = 108.0;
 
 [[stage(vertex)]]
 fn vs_main([[builtin(vertex_index)]] in_vertex_index: u32) -> [[builtin(position)]] vec4<f32> {
@@ -198,7 +204,7 @@ fn octree_ray(r: Ray, primary: bool) -> HitInfo {
         // Get position on surface of the octree
         dist = ray_box_dist(r, vec3<f32>(-1.0), vec3<f32>(1.0));
         if (dist == 0.0){
-            return HitInfo(false, 0u, vec3<f32>(0.0), vec3<f32>(0.0), 0u, 0u);
+            return HitInfo(false, 0u, r.pos, vec3<f32>(0.0), 0u, 0u);
         }
 
         pos = r.pos + dir * dist;
@@ -235,7 +241,7 @@ fn octree_ray(r: Ray, primary: bool) -> HitInfo {
         voxel_pos = pos + dir * t_current - normal * 0.000002;
 
         if (!in_bounds(voxel_pos)) {
-            return HitInfo(false, 0x20202000u, vec3<f32>(0.0), vec3<f32>(0.0), steps, voxel.depth);
+            return HitInfo(false, 0u, voxel_pos, normal, steps, voxel.depth);
         }
 
         steps = steps + 1u;
@@ -245,6 +251,105 @@ fn octree_ray(r: Ray, primary: bool) -> HitInfo {
     }
 
     return HitInfo(true, voxel.value, voxel_pos, normal, steps, voxel.depth);
+}
+
+fn terrain_enabled() -> bool {
+    // sun_dir.w is NaN when the height sheet should stay off (a loaded model, not the block world).
+    return u.sun_dir.w == u.sun_dir.w;
+}
+
+fn window_origin_blocks() -> vec3<f32> {
+    return vec3<f32>(u.dimensions.z, u.sun_dir.w, u.dimensions.w);
+}
+
+fn octree_to_blocks(p: vec3<f32>) -> vec3<f32> {
+    return (p + vec3<f32>(1.0)) * (WINDOW_SPAN * 0.5) + window_origin_blocks();
+}
+
+fn blocks_to_octree(b: vec3<f32>) -> vec3<f32> {
+    return (b - window_origin_blocks()) / WINDOW_SPAN * 2.0 - vec3<f32>(1.0);
+}
+
+// Same formula as terrain_surface in block_world.rs.
+fn terrain_surface(x: f32, z: f32) -> f32 {
+    return 72.0
+        + sin(x * 0.05) * 6.0
+        + cos(z * 0.05) * 6.0
+        + sin((x + z) * 0.02) * 14.0
+        + cos(x * 0.01 - z * 0.013) * 10.0;
+}
+
+// (dh/dx, dh/dz). Same formula as terrain_gradient in block_world.rs.
+fn terrain_gradient(x: f32, z: f32) -> vec2<f32> {
+    let a = x * 0.05;
+    let b = z * 0.05;
+    let c = (x + z) * 0.02;
+    let d = x * 0.01 - z * 0.013;
+    let dhdx = cos(a) * 0.30 + cos(c) * 0.28 - sin(d) * 0.10;
+    let dhdz = -sin(b) * 0.30 + cos(c) * 0.28 + sin(d) * 0.13;
+    return vec2<f32>(dhdx, dhdz);
+}
+
+struct SheetHit {
+    hit: bool;
+    pos: vec3<f32>;
+    normal: vec3<f32>;
+    albedo: vec3<f32>;
+    steps: u32;
+};
+
+fn sheet_at(x: f32, z: f32, steps: u32) -> SheetHit {
+    let h = terrain_surface(x, z);
+    let grad = terrain_gradient(x, z);
+    let normal = normalize(vec3<f32>(-grad.x, 1.0, -grad.y));
+    let slope = length(grad);
+    let t = clamp((slope - 0.2) / 0.45, 0.0, 1.0);
+    let cliff = t * t * (3.0 - 2.0 * t);
+    let grass = vec3<f32>(0.337, 0.686, 0.196);
+    let rock = vec3<f32>(0.34, 0.32, 0.30);
+    let albedo = mix(grass, rock, cliff);
+    let pos = blocks_to_octree(vec3<f32>(x, h, z));
+    return SheetHit(true, pos, normal, albedo, steps);
+}
+
+fn heightfield_ray(start_octree: vec3<f32>, dir: vec3<f32>) -> SheetHit {
+    var p = octree_to_blocks(start_octree);
+    let horiz = length(vec2<f32>(dir.x, dir.z));
+    let approach = TERRAIN_MAX_SLOPE * horiz - dir.y;
+    if (approach <= 0.02) {
+        let h = terrain_surface(p.x, p.z);
+        if (p.y <= h) {
+            return sheet_at(p.x, p.z, 0u);
+        }
+        return SheetHit(false, vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), 0u);
+    }
+
+    // Crests cannot exceed the sum of the amplitudes, so the air above them is empty.
+    if (p.y > TERRAIN_MAX_HEIGHT && dir.y < 0.0) {
+        p = p + dir * ((p.y - TERRAIN_MAX_HEIGHT) / -dir.y);
+    }
+
+    var steps = 0u;
+    loop {
+        if (steps >= 96u) {
+            break;
+        }
+        let h = terrain_surface(p.x, p.z);
+        let g = p.y - h;
+        if (g <= 0.05) {
+            return sheet_at(p.x, p.z, steps);
+        }
+        // dir is a unit vector in both spaces: the cube is scaled uniformly.
+        // The slope bound is above the real gradient, so this step meets the sheet.
+        p = p + dir * (g / approach);
+        steps = steps + 1u;
+    }
+    return SheetHit(false, vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), steps);
+}
+
+fn sky_colour(dir: vec3<f32>) -> vec3<f32> {
+    let t = clamp(dir.y * 0.45 + 0.35, 0.0, 1.0);
+    return mix(vec3<f32>(0.66, 0.74, 0.80), vec3<f32>(0.32, 0.48, 0.74), t);
 }
 
 [[stage(fragment)]]
@@ -258,33 +363,55 @@ fn fs_main(in: FSIn) -> [[location(0)]] vec4<f32> {
     let dir = normalize(dir.xyz / dir.w - pos);
     var ray = Ray(pos.xyz, dir.xyz);
 
-    let hit = octree_ray(ray, true);
+    let near = octree_ray(ray, true);
+    var far = SheetHit(false, vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), 0u);
+    if (!near.hit && terrain_enabled()) {
+        far = heightfield_ray(near.pos, ray.dir);
+    }
+
+    var hit_pos = near.pos;
+    var hit_normal = near.normal;
+    if (far.hit) {
+        hit_pos = far.pos;
+        hit_normal = far.normal;
+    }
+    let steps = near.steps + far.steps;
     // output_colour = vec3<f32>(hit.pos);
     if (u.show_steps) {
-        output_colour = vec3<f32>(f32(hit.steps) / 64.0);
+        output_colour = vec3<f32>(f32(steps) / 64.0);
     } else {
-        if (hit.hit) {
-            if (u.show_hits) {
-                output_colour = vec3<f32>(f32(n.data[hit.value] & 15u) / 15.0);
+        if (near.hit || far.hit) {
+            if (u.show_hits && near.hit) {
+                output_colour = vec3<f32>(f32(n.data[near.value] & 15u) / 15.0);
             } else {
                 let sun_dir = normalize(u.sun_dir.xyz);
 
                 let ambient = 0.3;
-                var diffuse = max(dot(hit.normal, -sun_dir), 0.0);
+                var diffuse = max(dot(hit_normal, -sun_dir), 0.0);
 
                 if (u.shadows) {
-                    let shadow_hit = octree_ray(Ray(hit.pos + hit.normal * 0.0000025, -sun_dir), true);
-                    if (shadow_hit.hit) {
+                    // Two blocks toward the sun, so the sheet under a block does not shadow that block.
+                    let shadow_origin = hit_pos + hit_normal * 0.0000025 + (-sun_dir) * (2.0 / 64.0);
+                    let shadow_near = octree_ray(Ray(shadow_origin, -sun_dir), true);
+                    var blocked = shadow_near.hit;
+                    if (!blocked && terrain_enabled()) {
+                        let shadow_far = heightfield_ray(shadow_near.pos, -sun_dir);
+                        blocked = shadow_far.hit;
+                    }
+                    if (blocked) {
                         diffuse = 0.0;
                     }
                 }
 
-                let value = node(hit.value) - VOXEL_OFFSET;
-                let colour = vec3<f32>(unpack_u8(value).yzw) / 255.0;
+                var colour = far.albedo;
+                if (near.hit) {
+                    let value = node(near.value) - VOXEL_OFFSET;
+                    colour = vec3<f32>(unpack_u8(value).yzw) / 255.0;
+                }
                 output_colour = (ambient + diffuse) * colour;
             }
         } else {
-            output_colour =  vec3<f32>(0.2);
+            output_colour = sky_colour(ray.dir);
         }
     }
 

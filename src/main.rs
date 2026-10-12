@@ -9,6 +9,7 @@ use winit::{
 
 mod adaptive;
 mod app;
+mod block_world;
 mod compute;
 mod cpu_octree;
 mod gpu;
@@ -18,6 +19,7 @@ mod render;
 mod world;
 use adaptive::*;
 use app::*;
+use block_world::*;
 use compute::*;
 use cpu_octree::*;
 use gpu::*;
@@ -95,6 +97,7 @@ pub struct Input {
     left: bool,
     up: bool,
     down: bool,
+    boost: bool,
     mouse_delta: Vector2<f32>,
 }
 
@@ -107,6 +110,7 @@ impl Input {
             left: false,
             up: false,
             down: false,
+            boost: false,
             mouse_delta: Vector2::zero(),
         }
     }
