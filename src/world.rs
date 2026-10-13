@@ -20,8 +20,8 @@ pub struct World {
 }
 
 impl World {
-    pub fn new(path: String) -> Self {
-        let mut world = Self {
+    pub fn bare(path: String) -> Self {
+        Self {
             path,
             chunks: Arc::new(DashMap::new()),
             loading: Arc::new(DashSet::new()),
@@ -33,7 +33,11 @@ impl World {
             coord_to_id: HashMap::new(),
             id_to_coord: HashMap::new(),
             next_stream_id: STREAM_BASE,
-        };
+        }
+    }
+
+    pub fn new(path: String) -> Self {
+        let mut world = Self::bare(path);
 
         world.chunks.insert(
             1,

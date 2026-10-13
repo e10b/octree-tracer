@@ -29,11 +29,13 @@ impl App {
         let gpu = Gpu::new(window).await;
         let procedural = Procedural::new(&gpu);
 
-        let mut world = World::minecraft();
-        let (spawn, look) = player_start(world.window_origin);
+        let (chunk, spawn, look) = load_e1m1();
+        let mut world = World::bare(String::new());
+        world.chunks.insert(0, chunk);
+        world.generate_mip_tree(0);
         character.pos = spawn;
         character.look = look;
-        character.speed = -5.5;
+        character.speed = -5.0;
 
         let gen_settings = GenSettings::default();
         // let cpu_octree = generate_world(&gen_settings, &blocks).unwrap();
@@ -338,6 +340,8 @@ impl App {
                             self.world.terrain_chunk_count(),
                             BLOCKS_PER_CHUNK,
                         ));
+                    } else {
+                        ui.label("Doom E1M1");
                     }
                 });
 

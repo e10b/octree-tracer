@@ -23,6 +23,8 @@ reinterpret = "0.2"
 indicatif = "0.16.2"
 dashmap = "5.2.0"
 tokio = { version = "1.17", features = [ "full" ] }
+image = { version = "0.24.9", default-features = false, features = ["png"] }
+json = "0.12.4"
 
 [profile.release]
 debug = 1
