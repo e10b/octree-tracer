@@ -9,11 +9,27 @@ pub struct Voxel {
     pub r: u8,
     pub g: u8,
     pub b: u8,
+    /// 0: no authored map, 1: mapped but dark, 2..=7: mapped emission intensity.
+    pub emission: u8,
 }
 
 impl Voxel {
     pub fn new(r: u8, g: u8, b: u8) -> Voxel {
-        Voxel { r, g, b }
+        Voxel {
+            r,
+            g,
+            b,
+            emission: 0,
+        }
+    }
+
+    pub fn with_emission(r: u8, g: u8, b: u8, emission: u8) -> Voxel {
+        Voxel {
+            r,
+            g,
+            b,
+            emission: emission.min(7),
+        }
     }
 
     #[allow(dead_code)]
@@ -22,7 +38,7 @@ impl Voxel {
         let g = (value >> 8) as u8;
         let b = value as u8;
 
-        Voxel::new(r, g, b)
+        Voxel::with_emission(r, g, b, ((value >> 24) & 7) as u8)
     }
 
     pub fn to_value(&self) -> u32 {
@@ -30,7 +46,10 @@ impl Voxel {
     }
 
     pub fn to_cpu_value(&self) -> u32 {
-        (self.r as u32) << 16 | (self.g as u32) << 8 | self.b as u32
+        ((self.emission.min(7) as u32) << 24)
+            | (self.r as u32) << 16
+            | (self.g as u32) << 8
+            | self.b as u32
     }
 }
 
@@ -213,6 +232,22 @@ impl std::fmt::Debug for Octree {
 
 impl std::fmt::Debug for Voxel {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
-        write!(f, "({}, {}, {})", self.r, self.g, self.b)
+        write!(
+            f,
+            "({}, {}, {}; emission {})",
+            self.r, self.g, self.b, self.emission
+        )
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::Voxel;
+
+    #[test]
+    fn voxel_gpu_value_preserves_authored_emission() {
+        let voxel = Voxel::with_emission(12, 34, 56, 6);
+        let unpacked = Voxel::from_value(voxel.to_cpu_value());
+        assert_eq!(unpacked, voxel);
     }
 }

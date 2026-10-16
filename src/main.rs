@@ -15,8 +15,10 @@ mod cpu_octree;
 mod doom;
 mod gpu;
 mod octree;
+mod play;
 mod procedural;
 mod render;
+mod wad;
 mod world;
 use adaptive::*;
 use app::*;
@@ -26,13 +28,71 @@ use cpu_octree::*;
 use doom::*;
 use gpu::*;
 use octree::*;
+use play::*;
 use procedural::*;
 use render::*;
 use world::*;
 
+fn wants_gzdoom() -> bool {
+    std::env::args().any(|arg| arg == "--gzdoom" || arg == "gzdoom")
+}
+
+fn gzdoom_binary() -> Option<std::path::PathBuf> {
+    if let Some(path) = std::env::var_os("GZDOOM") {
+        let path = std::path::PathBuf::from(path);
+        if path.is_file() {
+            return Some(path);
+        }
+    }
+    let bundles = [
+        "/Applications/GZDoom.app/Contents/MacOS/gzdoom",
+        "/Applications/GZDoom.app/Contents/MacOS/GZDoom",
+    ];
+    let home = std::env::var_os("HOME").map(std::path::PathBuf::from);
+    let mut candidates: Vec<std::path::PathBuf> = Vec::new();
+    if let Ok(cwd) = std::env::current_dir() {
+        candidates.push(cwd.join("../gzdoom/build/gzdoom.app/Contents/MacOS/gzdoom"));
+    }
+    candidates.extend(bundles.iter().map(std::path::PathBuf::from));
+    if let Some(home) = home {
+        for bundle in bundles {
+            candidates.push(home.join(bundle.trim_start_matches('/')));
+        }
+    }
+    candidates.into_iter().find(|path| path.is_file())
+}
+
+/// Real GZDoom, pointed at the IWAD directory this project already reads.
+fn run_gzdoom() -> i32 {
+    let Some(bin) = gzdoom_binary() else {
+        eprintln!("GZDoom is not installed.");
+        eprintln!("Install it with: brew install --cask gzdoom");
+        return 1;
+    };
+    let mut cmd = std::process::Command::new(&bin);
+    if let Some(wad) = wad::find_wad() {
+        if let Some(dir) = wad.parent() {
+            println!("GZDoom IWAD directory {}", dir.display());
+            cmd.env("DOOMWADDIR", dir);
+        }
+        cmd.arg("-iwad").arg(&wad);
+    }
+    println!("Running {}", bin.display());
+    match cmd.status() {
+        Ok(status) => status.code().unwrap_or(1),
+        Err(err) => {
+            eprintln!("Could not start GZDoom: {err}");
+            1
+        }
+    }
+}
+
 #[tokio::main]
 async fn main() {
     println!("octree-tracer v0.1.0");
+    if wants_gzdoom() {
+        std::process::exit(run_gzdoom());
+    }
 
     env_logger::init();
     let event_loop = EventLoop::new();
@@ -100,6 +160,8 @@ pub struct Input {
     up: bool,
     down: bool,
     boost: bool,
+    fire: bool,
+    use_door: bool,
     mouse_delta: Vector2<f32>,
 }
 
@@ -113,6 +175,8 @@ impl Input {
             up: false,
             down: false,
             boost: false,
+            fire: false,
+            use_door: false,
             mouse_delta: Vector2::zero(),
         }
     }

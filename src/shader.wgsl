@@ -21,10 +21,47 @@ struct AtomicU32s {
     data: [[stride(4)]] array<u32>;
 };
 
+struct HistoryPixel {
+    // radiance.xyz is demodulated illumination. w is the accepted history length.
+    radiance: vec4<f32>;
+    position: vec4<f32>;
+    // normal.w is the primary-ray hit distance, used by the depth edge stop.
+    normal: vec4<f32>;
+    // moments.xy are the first and second raw moments of illumination luminance.
+    moments: vec4<f32>;
+    albedo: vec4<f32>;
+};
+
+struct History {
+    data: array<HistoryPixel>;
+};
+
+struct PathUniforms {
+    frame_index: u32;
+    max_bounces: u32;
+    texture_emission: f32;
+    temporal_history: f32;
+    history_valid: u32;
+    padding0: u32;
+    padding1: u32;
+    padding2: u32;
+    previous_camera: mat4x4<f32>;
+};
+
 [[group(0), binding(0)]]
 var<uniform> u: Uniforms; // uniforms
 [[group(0), binding(1)]]
 var<storage, read_write> n: U32s; // nodes
+// read_write, not read: Metal puts read-only storage in the constant address
+// space, which is too small for a full-frame history buffer.
+[[group(0), binding(2)]]
+var<storage, read_write> history_in: History;
+[[group(0), binding(3)]]
+var<uniform> path: PathUniforms;
+[[group(0), binding(4)]]
+var<storage, read_write> history_out: History;
+[[group(0), binding(5)]]
+var blue_noise: texture_2d<f32>;
 
 
 let VOXEL_OFFSET = 134217728u;
@@ -352,81 +389,319 @@ fn sky_colour(dir: vec3<f32>) -> vec3<f32> {
     return mix(vec3<f32>(0.66, 0.74, 0.80), vec3<f32>(0.32, 0.48, 0.74), t);
 }
 
+struct SceneHit {
+    hit: bool;
+    pos: vec3<f32>;
+    normal: vec3<f32>;
+    albedo: vec3<f32>;
+    steps: u32;
+    hit_count: f32;
+    emission: f32;
+};
+
+fn scene_ray(ray: Ray, primary: bool) -> SceneHit {
+    let near = octree_ray(ray, primary);
+    if (near.hit) {
+        let value = node(near.value) - VOXEL_OFFSET;
+        let albedo = vec3<f32>(unpack_u8(value).yzw) / 255.0;
+        let hit_count = f32(n.data[near.value] & 15u) / 15.0;
+        let emission_code = (value >> 24u) & 7u;
+        var emission = 0.0;
+        if (emission_code > 1u) {
+            emission = f32(emission_code - 1u) / 6.0;
+        }
+        return SceneHit(
+            true,
+            near.pos,
+            near.normal,
+            albedo,
+            near.steps,
+            hit_count,
+            emission,
+        );
+    }
+
+    if (terrain_enabled()) {
+        let far = heightfield_ray(near.pos, ray.dir);
+        if (far.hit) {
+            return SceneHit(true, far.pos, far.normal, far.albedo, near.steps + far.steps, 0.0, 0.0);
+        }
+        return SceneHit(false, far.pos, far.normal, far.albedo, near.steps + far.steps, 0.0, 0.0);
+    }
+
+    return SceneHit(false, near.pos, near.normal, vec3<f32>(0.0), near.steps, 0.0, 0.0);
+}
+
+fn hash_u32(value: u32) -> u32 {
+    var x = value;
+    x = x ^ (x >> 16u);
+    x = x * 0x7feb352du;
+    x = x ^ (x >> 15u);
+    x = x * 0x846ca68bu;
+    x = x ^ (x >> 16u);
+    return x;
+}
+
+fn random_float(seed: u32) -> f32 {
+    return f32(hash_u32(seed)) * (1.0 / 4294967296.0);
+}
+
+fn cosine_hemisphere(normal: vec3<f32>, seed: u32) -> vec3<f32> {
+    let r1 = random_float(seed);
+    let r2 = random_float(seed ^ 0x9e3779b9u);
+    let phi = 6.28318530718 * r1;
+    let radius = sqrt(r2);
+    let local = vec3<f32>(cos(phi) * radius, sqrt(1.0 - r2), sin(phi) * radius);
+
+    var helper = vec3<f32>(0.0, 1.0, 0.0);
+    if (abs(normal.y) > 0.999) {
+        helper = vec3<f32>(1.0, 0.0, 0.0);
+    }
+    let tangent = normalize(cross(helper, normal));
+    let bitangent = cross(normal, tangent);
+    return normalize(tangent * local.x + normal * local.y + bitangent * local.z);
+}
+
+fn sun_visible(pos: vec3<f32>, normal: vec3<f32>, sun_direction: vec3<f32>) -> bool {
+    if (!u.shadows) {
+        return true;
+    }
+    let origin = pos + normal * 0.000004 + sun_direction * 0.000004;
+    return !scene_ray(Ray(origin, sun_direction), false).hit;
+}
+
+struct PathSample {
+    radiance: vec3<f32>;
+    depth: f32;
+    steps: u32;
+    first_albedo: vec3<f32>;
+    first_hit: bool;
+    first_hit_count: f32;
+    first_pos: vec3<f32>;
+    first_normal: vec3<f32>;
+};
+
+fn trace_path(camera_pos: vec3<f32>, camera_dir: vec3<f32>, seed: u32) -> PathSample {
+    var ray = Ray(camera_pos, camera_dir);
+    var throughput = vec3<f32>(1.0);
+    var radiance = vec3<f32>(0.0);
+    var depth = 1000.0;
+    var first_steps = 0u;
+    var first_albedo = vec3<f32>(0.0);
+    var first_hit = false;
+    var first_hit_count = 0.0;
+    var first_pos = vec3<f32>(0.0);
+    var first_normal = vec3<f32>(0.0);
+    var bounce = 0u;
+
+    loop {
+        if (bounce >= path.max_bounces) { break; }
+        // The first indirect segment must refine geometry too. Otherwise portals
+        // outside the camera frustum remain represented by opaque coarse voxels,
+        // so bounced skylight can never discover them.
+        let hit = scene_ray(ray, bounce <= 1u);
+        if (bounce == 0u) {
+            first_steps = hit.steps;
+            first_albedo = hit.albedo;
+            first_hit = hit.hit;
+            first_hit_count = hit.hit_count;
+            if (hit.hit) {
+                depth = length(hit.pos - camera_pos);
+                first_pos = hit.pos;
+                first_normal = hit.normal;
+            }
+        }
+
+        if (!hit.hit) {
+            radiance = radiance + throughput * sky_colour(ray.dir) * 1.5;
+            break;
+        }
+
+        let emitted = hit.albedo * (hit.emission * path.texture_emission);
+        radiance = radiance + throughput * emitted;
+
+        let sun_direction = normalize(-u.sun_dir.xyz);
+        let n_dot_l = max(dot(hit.normal, sun_direction), 0.0);
+        if (n_dot_l > 0.0 && sun_visible(hit.pos, hit.normal, sun_direction)) {
+            let sun_radiance = vec3<f32>(2.4, 2.25, 2.0);
+            radiance = radiance + throughput * hit.albedo * sun_radiance * n_dot_l;
+        }
+
+        throughput = throughput * hit.albedo;
+        if (bounce >= 2u) {
+            let survive = clamp(max(max(throughput.x, throughput.y), throughput.z), 0.1, 0.95);
+            if (random_float(seed ^ hash_u32(bounce * 0x632be59bu)) > survive) {
+                break;
+            }
+            throughput = throughput / survive;
+        }
+
+        let bounce_seed = hash_u32(seed ^ (bounce + 1u) * 0x9e3779b9u);
+        let next_dir = cosine_hemisphere(hit.normal, bounce_seed);
+        ray = Ray(hit.pos + hit.normal * 0.000004 + next_dir * 0.000004, next_dir);
+        bounce = bounce + 1u;
+    }
+
+    return PathSample(
+        radiance,
+        depth,
+        first_steps,
+        first_albedo,
+        first_hit,
+        first_hit_count,
+        first_pos,
+        first_normal,
+    );
+}
+
+fn luminance(colour: vec3<f32>) -> f32 {
+    return dot(colour, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+fn history_matches(previous: HistoryPixel, pos: vec3<f32>, normal: vec3<f32>, depth: f32) -> bool {
+    let position_tolerance = 0.003 + depth * 0.002;
+    return previous.position.w > 0.5
+        && distance(previous.position.xyz, pos) < position_tolerance
+        && dot(previous.normal.xyz, normal) > 0.8;
+}
+
+struct TemporalHistory {
+    illumination: vec3<f32>;
+    moment1: f32;
+    moment2: f32;
+    history_length: f32;
+    weight: f32;
+};
+
+fn consider_history(
+    coord: vec2<i32>,
+    weight: f32,
+    pos: vec3<f32>,
+    normal: vec3<f32>,
+    depth: f32,
+    acc: TemporalHistory,
+) -> TemporalHistory {
+    if (weight <= 0.0 || coord.x < 0 || coord.y < 0) {
+        return acc;
+    }
+    if (coord.x >= i32(u.dimensions.x) || coord.y >= i32(u.dimensions.y)) {
+        return acc;
+    }
+    let index = u32(coord.y) * u32(u.dimensions.x) + u32(coord.x);
+    let previous = history_in.data[index];
+    if (!history_matches(previous, pos, normal, depth)) {
+        return acc;
+    }
+    var next: TemporalHistory;
+    // radiance.xyz is last frame's filtered illumination. Moments stay
+    // unfiltered so the variance estimate does not collapse across frames.
+    next.illumination = acc.illumination + previous.radiance.xyz * weight;
+    next.moment1 = acc.moment1 + previous.moments.x * weight;
+    next.moment2 = acc.moment2 + previous.moments.y * weight;
+    next.history_length = acc.history_length + previous.radiance.w * weight;
+    next.weight = acc.weight + weight;
+    return next;
+}
+
+struct FSOut {
+    [[location(0)]] illumination: vec4<f32>;
+    [[location(1)]] normal: vec4<f32>;
+    [[location(2)]] albedo: vec4<f32>;
+    [[location(3)]] moments: vec4<f32>;
+    [[builtin(frag_depth)]] depth: f32;
+};
+
 [[stage(fragment)]]
-fn fs_main(in: FSIn) -> [[location(0)]] vec4<f32> {
-    var output_colour = vec3<f32>(0.0, 0.0, 0.0);
-    let clip_space = get_clip_space(in.frag_pos, u.dimensions.xy);
+fn fs_main(in: FSIn) -> FSOut {
+    let pixel = vec2<u32>(in.frag_pos.xy);
+    let pixel_index = pixel.y * u32(u.dimensions.x) + pixel.x;
+    let noise_coord = vec2<i32>(i32(pixel.x % 64u), i32(pixel.y % 64u));
+    let blue = textureLoad(blue_noise, noise_coord, 0).rg;
+    let frame_shift = vec2<f32>(
+        random_float(hash_u32(path.frame_index * 0x9e3779b9u)),
+        random_float(hash_u32(path.frame_index * 0x68bc21ebu + 1u)),
+    );
+    let jitter = fract(blue + frame_shift) - vec2<f32>(0.5);
+    let blue_seed = u32(blue.x * 255.0) | (u32(blue.y * 255.0) << 8u);
+    let seed = hash_u32(pixel.x + pixel.y * 65537u + path.frame_index * 0x9e3779b9u ^ blue_seed);
+    let clip_space = get_clip_space(in.frag_pos + vec4<f32>(jitter, 0.0, 0.0), u.dimensions.xy);
 
     let pos = u.camera_inverse * vec4<f32>(0.0, 0.0, 0.0, 1.0);
     let dir = u.camera_inverse * vec4<f32>(clip_space.x, clip_space.y, 1.0, 1.0);
     let pos = pos.xyz / pos.w;
     let dir = normalize(dir.xyz / dir.w - pos);
-    var ray = Ray(pos.xyz, dir.xyz);
+    let sample = trace_path(pos, dir, seed);
+    var sample_colour = sample.radiance;
 
-    let near = octree_ray(ray, true);
-    var far = SheetHit(false, vec3<f32>(0.0), vec3<f32>(0.0), vec3<f32>(0.0), 0u);
-    if (!near.hit && terrain_enabled()) {
-        far = heightfield_ray(near.pos, ray.dir);
-    }
-
-    var hit_pos = near.pos;
-    var hit_normal = near.normal;
-    if (far.hit) {
-        hit_pos = far.pos;
-        hit_normal = far.normal;
-    }
-    let steps = near.steps + far.steps;
-    // output_colour = vec3<f32>(hit.pos);
     if (u.show_steps) {
-        output_colour = vec3<f32>(f32(steps) / 64.0);
-    } else {
-        if (near.hit || far.hit) {
-            if (u.show_hits && near.hit) {
-                output_colour = vec3<f32>(f32(n.data[near.value] & 15u) / 15.0);
-            } else {
-                let sun_dir = normalize(u.sun_dir.xyz);
+        sample_colour = vec3<f32>(f32(sample.steps) / 64.0);
+    } else if (u.show_hits && sample.first_hit) {
+        sample_colour = vec3<f32>(sample.first_hit_count);
+    }
 
-                let ambient = 0.3;
-                var diffuse = max(dot(hit_normal, -sun_dir), 0.0);
+    // SVGF filters illumination, then multiplies the center albedo back on.
+    // Dividing by the first-hit albedo keeps the wavelet from smearing textures.
+    var albedo = vec3<f32>(1.0);
+    if (sample.first_hit && !u.show_steps && !u.show_hits) {
+        // Floor keeps demodulation invertible when a texel channel is black.
+        albedo = max(sample.first_albedo, vec3<f32>(0.001));
+    }
+    let noisy_illumination = sample_colour / albedo;
+    let noisy_luma = luminance(noisy_illumination);
+    var integrated = noisy_illumination;
+    var moment1 = noisy_luma;
+    var moment2 = noisy_luma * noisy_luma;
+    var history_length = 1.0;
 
-                if (u.shadows) {
-                    // Two blocks toward the sun, so the sheet under a block does not shadow that block.
-                    let shadow_origin = hit_pos + hit_normal * 0.0000025 + (-sun_dir) * (2.0 / 64.0);
-                    let shadow_near = octree_ray(Ray(shadow_origin, -sun_dir), true);
-                    var blocked = shadow_near.hit;
-                    if (!blocked && terrain_enabled()) {
-                        let shadow_far = heightfield_ray(shadow_near.pos, -sun_dir);
-                        blocked = shadow_far.hit;
-                    }
-                    if (blocked) {
-                        diffuse = 0.0;
-                    }
+    if (path.history_valid != 0u && sample.first_hit) {
+        let previous_clip = path.previous_camera * vec4<f32>(sample.first_pos, 1.0);
+        // create_proj_matrix is the renderer's inverse-ray basis rather than a
+        // conventional homogeneous projection. Its transformed z is the
+        // perspective divisor; w remains 1 for world positions.
+        if (previous_clip.z > 0.00001) {
+            let previous_ndc = previous_clip.xy / previous_clip.z;
+            let previous_uv = previous_ndc * vec2<f32>(0.5, -0.5) + vec2<f32>(0.5);
+            if (all(previous_uv >= vec2<f32>(0.0)) && all(previous_uv < vec2<f32>(1.0))) {
+                // Bilinear footprints sit halfway between pixel centers.
+                let tex = previous_uv * u.dimensions.xy - vec2<f32>(0.5);
+                let origin = vec2<i32>(floor(tex));
+                let frac = fract(tex);
+                var acc: TemporalHistory;
+                acc.illumination = vec3<f32>(0.0);
+                acc.moment1 = 0.0;
+                acc.moment2 = 0.0;
+                acc.history_length = 0.0;
+                acc.weight = 0.0;
+                acc = consider_history(origin + vec2<i32>(0, 0), (1.0 - frac.x) * (1.0 - frac.y), sample.first_pos, sample.first_normal, sample.depth, acc);
+                acc = consider_history(origin + vec2<i32>(1, 0), frac.x * (1.0 - frac.y), sample.first_pos, sample.first_normal, sample.depth, acc);
+                acc = consider_history(origin + vec2<i32>(0, 1), (1.0 - frac.x) * frac.y, sample.first_pos, sample.first_normal, sample.depth, acc);
+                acc = consider_history(origin + vec2<i32>(1, 1), frac.x * frac.y, sample.first_pos, sample.first_normal, sample.depth, acc);
+                if (acc.weight > 0.0) {
+                    let inv = 1.0 / acc.weight;
+                    history_length = min(acc.history_length * inv + 1.0, 64.0);
+                    // The slider is the steady-state history weight. Early frames
+                    // still use 1/N so the moments are an unbiased running estimate.
+                    let alpha = max(1.0 - path.temporal_history, 1.0 / history_length);
+                    integrated = mix(acc.illumination * inv, noisy_illumination, alpha);
+                    moment1 = mix(acc.moment1 * inv, noisy_luma, alpha);
+                    moment2 = mix(acc.moment2 * inv, noisy_luma * noisy_luma, alpha);
                 }
-
-                var colour = far.albedo;
-                if (near.hit) {
-                    let value = node(near.value) - VOXEL_OFFSET;
-                    colour = vec3<f32>(unpack_u8(value).yzw) / 255.0;
-                }
-                output_colour = (ambient + diffuse) * colour;
             }
-        } else {
-            output_colour = sky_colour(ray.dir);
         }
     }
 
-    // let ahha = u.dimensions.x * u.dimensions.y;
-    // output_colour = vec3<f32>(f32(atomicAdd(&d.atomic_int, 1u)) / ahha);
+    history_out.data[pixel_index].radiance = vec4<f32>(integrated, history_length);
+    history_out.data[pixel_index].position = vec4<f32>(sample.first_pos, f32(sample.first_hit));
+    history_out.data[pixel_index].normal = vec4<f32>(sample.first_normal, sample.depth);
+    history_out.data[pixel_index].moments = vec4<f32>(moment1, moment2, 0.0, 0.0);
+    history_out.data[pixel_index].albedo = vec4<f32>(albedo, 0.0);
 
-    // if (atomicLoad(&d.atomic_int) > u32(ahha)) {
-    //     atomicStore(&d.atomic_int, 0u);
-    // }
-
-    // let pos = u.misc_value * vec3<f32>(clip_space, u.misc_value);
-    // let value = find_voxel(pos, true).value;
-
-    // output_colour = vec3<f32>(unpack_u8(value).yzw);
-    // output_colour = pos;
-
-    return vec4<f32>(pow(clamp(output_colour, vec3<f32>(0.0), vec3<f32>(1.0)), vec3<f32>(f32(u.misc_bool) * -1.2 + 2.2)), 0.5);
+    let depth = sample.depth / (sample.depth + 1.0);
+    return FSOut(
+        vec4<f32>(integrated, history_length),
+        vec4<f32>(sample.first_normal, sample.depth),
+        vec4<f32>(albedo, f32(sample.first_hit)),
+        vec4<f32>(moment1, moment2, 0.0, 0.0),
+        depth,
+    );
 }

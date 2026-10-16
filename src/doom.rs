@@ -22,9 +22,29 @@ struct Cell {
     color: Voxel,
 }
 
-/// Load the E1M1 hangar mesh and voxelize it at texture-pixel scale: one map unit,
-/// one texel, one voxel. The cube is the next power of two that contains the map.
-pub fn load_e1m1() -> (CpuOctree, Point3<f32>, Vector3<f32>) {
+pub struct LoadedMap {
+    pub chunk: CpuOctree,
+    pub spawn: Point3<f32>,
+    pub look: Vector3<f32>,
+    pub grid: i32,
+    pub walk: bool,
+    pub pictures: crate::play::Pictures,
+}
+
+/// Load E1M1 at one texel per voxel. A Doom WAD on disk supplies the map, the
+/// pictures, and the things. The hangar mesh is the fallback when no WAD is found.
+pub fn load_e1m1() -> LoadedMap {
+    if let Some(map) = crate::wad::try_load_e1m1() {
+        return finish(
+            map.voxels,
+            map.spawn,
+            map.look,
+            map.grid,
+            true,
+            map.pictures,
+        );
+    }
+
     let (tris, images) = read_glb(DOOM_GLB).expect("Doom E1M1 map");
     let (min, max) = bounds(&tris);
     let span = (0..3)
@@ -32,7 +52,6 @@ pub fn load_e1m1() -> (CpuOctree, Point3<f32>, Vector3<f32>) {
         .max()
         .unwrap_or(1);
     let grid = (span as u32).next_power_of_two().max(1) as i32;
-    let bits = grid.trailing_zeros() as i32;
     let offset = [-min[0], -min[1], -min[2]];
     println!(
         "Voxelizing Doom E1M1 ({} triangles) at 1 texel per voxel into {grid}³",
@@ -43,9 +62,27 @@ pub fn load_e1m1() -> (CpuOctree, Point3<f32>, Vector3<f32>) {
     for tri in &tris {
         stamp_triangle(tri, TEXEL_SCALE, offset, grid, &images, &mut voxels);
     }
-    println!("Doom E1M1: {} solid voxels", voxels.len());
-
     let (spawn_voxel, look_grid) = stand_in_the_map(&voxels);
+    finish(
+        voxels,
+        spawn_voxel,
+        look_grid,
+        grid,
+        false,
+        crate::play::Pictures::empty(),
+    )
+}
+
+fn finish(
+    voxels: HashMap<u64, Voxel>,
+    spawn_voxel: [i32; 3],
+    look_grid: [f32; 3],
+    grid: i32,
+    walk: bool,
+    pictures: crate::play::Pictures,
+) -> LoadedMap {
+    let bits = grid.trailing_zeros() as i32;
+    println!("Doom E1M1: {} solid voxels", voxels.len());
     let mut cells: Vec<Cell> = voxels
         .into_iter()
         .map(|(key, color)| {
@@ -64,8 +101,14 @@ pub fn load_e1m1() -> (CpuOctree, Point3<f32>, Vector3<f32>) {
         top_mip: Voxel::new(0, 0, 0),
     };
     let spawn = voxel_center(spawn_voxel, grid);
-    let look = Vector3::new(look_grid[0], look_grid[1], look_grid[2]);
-    (octree, Point3::new(spawn.x, spawn.y, spawn.z), look)
+    LoadedMap {
+        chunk: octree,
+        spawn: Point3::new(spawn.x, spawn.y, spawn.z),
+        look: Vector3::new(look_grid[0], look_grid[1], look_grid[2]),
+        grid,
+        walk,
+        pictures,
+    }
 }
 
 fn bounds(tris: &[Tri]) -> ([f32; 3], [f32; 3]) {
@@ -311,6 +354,326 @@ fn voxel_center(v: [i32; 3], grid: i32) -> Vector3<f32> {
     )
 }
 
+fn world_to_voxel(p: Point3<f32>, grid: i32) -> [f32; 3] {
+    let n = grid as f32;
+    [
+        (p.x + 1.0) * 0.5 * n - 0.5,
+        (p.y + 1.0) * 0.5 * n - 0.5,
+        (p.z + 1.0) * 0.5 * n - 0.5,
+    ]
+}
+
+fn voxel_to_world(v: [f32; 3], grid: i32) -> Point3<f32> {
+    let n = grid as f32;
+    Point3::new(
+        -1.0 + (v[0] + 0.5) * 2.0 / n,
+        -1.0 + (v[1] + 0.5) * 2.0 / n,
+        -1.0 + (v[2] + 0.5) * 2.0 / n,
+    )
+}
+
+const PLAYER_EYE: f32 = 41.0;
+const STEP_UP: i32 = 24;
+const BODY_RADIUS: f32 = 16.0;
+const GRAVITY: f32 = 1225.0;
+const JUMP_SPEED: f32 = 280.0;
+const BODY_CLEAR: f32 = 0.25;
+
+/// Leaf centers sit on integers, so the cell covering `p` is the nearest index.
+fn cell_at(p: f32) -> i32 {
+    (p + 0.5).floor() as i32
+}
+
+fn cell_solid(octree: &CpuOctree, grid: i32, x: i32, y: i32, z: i32) -> bool {
+    if x < 0 || y < 0 || z < 0 || x >= grid || y >= grid || z >= grid {
+        return true;
+    }
+    let p = voxel_center([x, y, z], grid);
+    let (node, _, _) = octree.find_voxel(Vector3::new(p.x, p.y, p.z), None);
+    octree.nodes[node].value != Voxel::new(0, 0, 0)
+}
+
+fn body_offsets() -> [(f32, f32); 9] {
+    let r = BODY_RADIUS;
+    [
+        (0.0, 0.0),
+        (r, 0.0),
+        (-r, 0.0),
+        (0.0, r),
+        (0.0, -r),
+        (r * 0.7, r * 0.7),
+        (r * 0.7, -r * 0.7),
+        (-r * 0.7, r * 0.7),
+        (-r * 0.7, -r * 0.7),
+    ]
+}
+
+/// Closest floor surface to the feet, in a window that includes one stair up.
+fn surface_near(octree: &CpuOctree, grid: i32, x: f32, z: f32, feet: f32) -> Option<i32> {
+    let ix = cell_at(x);
+    let iz = cell_at(z);
+    let top = cell_at(feet + STEP_UP as f32);
+    let bot = cell_at(feet - 96.0);
+    let mut best: Option<i32> = None;
+    let mut best_dist = f32::MAX;
+    for y in (bot..=top).rev() {
+        if !cell_solid(octree, grid, ix, y, iz) || cell_solid(octree, grid, ix, y + 1, iz) {
+            continue;
+        }
+        let surface = y as f32 + 0.5;
+        let rise = surface - feet;
+        if rise > STEP_UP as f32 || rise < -96.0 {
+            continue;
+        }
+        let dist = rise.abs();
+        if dist < best_dist {
+            best_dist = dist;
+            best = Some(y);
+        }
+    }
+    best
+}
+
+/// A column blocks the body when it is taller than a stair. A rise of at most
+/// 24 with air above it is a step, and the body may overlap it.
+fn column_blocks(octree: &CpuOctree, grid: i32, x: i32, z: i32, floor: i32) -> bool {
+    let mut y = floor + 1;
+    // Stop short of a 56-unit ceiling slab. A real wall is solid the whole way up.
+    let limit = floor + 50;
+    while y <= limit {
+        if !cell_solid(octree, grid, x, y, z) {
+            y += 1;
+            continue;
+        }
+        let mut top = y;
+        while top <= limit && cell_solid(octree, grid, x, top, z) {
+            top += 1;
+        }
+        if top > limit {
+            return true;
+        }
+        if (top - 1) - floor > STEP_UP {
+            return true;
+        }
+        y = top;
+    }
+    false
+}
+
+fn hits_wall(octree: &CpuOctree, grid: i32, eye: [f32; 3], floor: i32) -> bool {
+    body_offsets().iter().any(|(ox, oz)| {
+        column_blocks(
+            octree,
+            grid,
+            cell_at(eye[0] + ox),
+            cell_at(eye[2] + oz),
+            floor,
+        )
+    })
+}
+
+fn body_solid(octree: &CpuOctree, grid: i32, eye: [f32; 3]) -> bool {
+    let feet = eye[1] - PLAYER_EYE;
+    let heights = [feet + 8.0, feet + 28.0, feet + 48.0];
+    for (ox, oz) in body_offsets() {
+        for y in heights {
+            if cell_solid(
+                octree,
+                grid,
+                cell_at(eye[0] + ox),
+                cell_at(y),
+                cell_at(eye[2] + oz),
+            ) {
+                return true;
+            }
+        }
+    }
+    false
+}
+
+pub fn fits_body(octree: &CpuOctree, grid: i32, pos: Point3<f32>) -> bool {
+    !body_solid(octree, grid, world_to_voxel(pos, grid))
+}
+
+fn try_move(
+    octree: &CpuOctree,
+    grid: i32,
+    eye: [f32; 3],
+    dx: f32,
+    dz: f32,
+    on_ground: bool,
+) -> Option<[f32; 3]> {
+    let mut next = eye;
+    next[0] += dx;
+    next[2] += dz;
+    let feet = eye[1] - PLAYER_EYE;
+    if on_ground {
+        if let Some(floor) = surface_near(octree, grid, next[0], next[2], feet) {
+            let surface = floor as f32 + 0.5;
+            let rise = surface - feet;
+            if rise <= STEP_UP as f32 && rise >= -(STEP_UP as f32) {
+                next[1] = surface + PLAYER_EYE + BODY_CLEAR;
+                if !hits_wall(octree, grid, next, floor) {
+                    return Some(next);
+                }
+                return None;
+            }
+            if rise < -(STEP_UP as f32) && !body_solid(octree, grid, next) {
+                return Some(next);
+            }
+            return None;
+        }
+    }
+    if body_solid(octree, grid, next) {
+        None
+    } else {
+        Some(next)
+    }
+}
+
+fn slide(
+    octree: &CpuOctree,
+    grid: i32,
+    eye: [f32; 3],
+    dx: f32,
+    dz: f32,
+    on_ground: bool,
+) -> [f32; 3] {
+    if let Some(moved) = try_move(octree, grid, eye, dx, dz, on_ground) {
+        return moved;
+    }
+    if dx.abs() > 1.0e-6 {
+        if let Some(moved) = try_move(octree, grid, eye, dx, 0.0, on_ground) {
+            return moved;
+        }
+    }
+    if dz.abs() > 1.0e-6 {
+        if let Some(moved) = try_move(octree, grid, eye, 0.0, dz, on_ground) {
+            return moved;
+        }
+    }
+    eye
+}
+
+/// Walk, run, and jump against the voxel map. `wish` is a horizontal direction
+/// in world space. Speed is in map units per second, which is one voxel.
+pub fn step_on_foot(
+    octree: &CpuOctree,
+    grid: i32,
+    pos: Point3<f32>,
+    wish: Vector3<f32>,
+    speed: f32,
+    mut vy: f32,
+    dt: f32,
+    jump: bool,
+    mut on_ground: bool,
+) -> (Point3<f32>, f32, bool) {
+    let mut eye = world_to_voxel(pos, grid);
+    let dx = wish.x * speed * dt;
+    let dz = wish.z * speed * dt;
+    let dist = (dx * dx + dz * dz).sqrt();
+    let sub = (dist / 4.0).ceil().max(1.0) as i32;
+    if dist > 1e-6 {
+        let sx = dx / sub as f32;
+        let sz = dz / sub as f32;
+        for _ in 0..sub {
+            eye = slide(octree, grid, eye, sx, sz, on_ground);
+        }
+    }
+
+    if jump && on_ground {
+        vy = JUMP_SPEED;
+        on_ground = false;
+    }
+
+    let feet = eye[1] - PLAYER_EYE;
+    if on_ground {
+        match surface_near(octree, grid, eye[0], eye[2], feet) {
+            Some(floor) if (floor as f32 + 0.5 - feet).abs() <= STEP_UP as f32 + 1.0 => {
+                eye[1] = floor as f32 + 0.5 + PLAYER_EYE + BODY_CLEAR;
+                vy = 0.0;
+            }
+            _ => on_ground = false,
+        }
+    }
+    if !on_ground {
+        vy = (vy - GRAVITY * dt).max(-2400.0);
+        let dy = vy * dt;
+        let steps = (dy.abs() / 4.0).ceil().max(1.0) as i32;
+        let step = dy / steps as f32;
+        for _ in 0..steps {
+            let mut moved = eye;
+            moved[1] += step;
+            if step < 0.0 {
+                if let Some(floor) = surface_near(octree, grid, eye[0], eye[2], eye[1] - PLAYER_EYE)
+                {
+                    let surface = floor as f32 + 0.5;
+                    if moved[1] - PLAYER_EYE <= surface + BODY_CLEAR {
+                        eye[1] = surface + PLAYER_EYE + BODY_CLEAR;
+                        on_ground = true;
+                        vy = 0.0;
+                        break;
+                    }
+                }
+            }
+            if body_solid(octree, grid, moved) {
+                vy = 0.0;
+                break;
+            }
+            eye = moved;
+        }
+    }
+
+    (voxel_to_world(eye, grid), vy, on_ground)
+}
+
+/// World distance to the first solid voxel along a unit direction.
+pub fn wall_distance(octree: &CpuOctree, grid: i32, eye: Point3<f32>, dir: Vector3<f32>) -> f32 {
+    let scale = grid as f32 * 0.5;
+    let origin = world_to_voxel(eye, grid);
+    let delta = [dir.x * scale, dir.y * scale, dir.z * scale];
+    if delta[0] * delta[0] + delta[1] * delta[1] + delta[2] * delta[2] < 1.0e-12 {
+        return 1.0e6;
+    }
+    let mut cell = [cell_at(origin[0]), cell_at(origin[1]), cell_at(origin[2])];
+    let mut t_max = [f32::MAX; 3];
+    let mut t_delta = [f32::MAX; 3];
+    let mut step = [0; 3];
+    for axis in 0..3 {
+        if delta[axis].abs() < 1.0e-8 {
+            continue;
+        }
+        step[axis] = if delta[axis] > 0.0 { 1 } else { -1 };
+        let edge = if delta[axis] > 0.0 {
+            cell[axis] as f32 + 0.5
+        } else {
+            cell[axis] as f32 - 0.5
+        };
+        t_max[axis] = (edge - origin[axis]) / delta[axis];
+        t_delta[axis] = (1.0 / delta[axis]).abs();
+    }
+    let mut t = 0.0;
+    for _ in 0..8000 {
+        if t > 3.0 / grid as f32 && cell_solid(octree, grid, cell[0], cell[1], cell[2]) {
+            return t;
+        }
+        let axis = if t_max[0] < t_max[1] && t_max[0] < t_max[2] {
+            0
+        } else if t_max[1] < t_max[2] {
+            1
+        } else {
+            2
+        };
+        if t_max[axis] > 4000.0 {
+            break;
+        }
+        t = t_max[axis];
+        cell[axis] += step[axis];
+        t_max[axis] += t_delta[axis];
+    }
+    1.0e6
+}
+
 fn pack(x: i32, y: i32, z: i32) -> u64 {
     (x as u64) | ((y as u64) << 16) | ((z as u64) << 32)
 }
@@ -463,11 +826,7 @@ fn push_primitive(
     let uvs = if primitive["attributes"]["TEXCOORD_0"].is_null() {
         Vec::new()
     } else {
-        read_vec2(
-            doc,
-            blob,
-            usize_of(&primitive["attributes"]["TEXCOORD_0"])?,
-        )?
+        read_vec2(doc, blob, usize_of(&primitive["attributes"]["TEXCOORD_0"])?)?
     };
     if primitive["indices"].is_null() {
         return Ok(());
@@ -528,11 +887,7 @@ fn glb_chunks(bytes: &[u8]) -> Result<(&[u8], &[u8]), String> {
     ))
 }
 
-fn view_bytes<'a>(
-    doc: &json::JsonValue,
-    blob: &'a [u8],
-    index: usize,
-) -> Result<&'a [u8], String> {
+fn view_bytes<'a>(doc: &json::JsonValue, blob: &'a [u8], index: usize) -> Result<&'a [u8], String> {
     let view = &doc["bufferViews"][index];
     let start = view["byteOffset"].as_u64().unwrap_or(0) as usize;
     let len = usize_of(&view["byteLength"])?;
@@ -601,7 +956,10 @@ fn accessor_bytes<'a>(
     let view = &doc["bufferViews"][view_index];
     let start = view["byteOffset"].as_u64().unwrap_or(0) as usize
         + accessor["byteOffset"].as_u64().unwrap_or(0) as usize;
-    let stride = view["byteStride"].as_u64().map(|n| n as usize).unwrap_or(tightly);
+    let stride = view["byteStride"]
+        .as_u64()
+        .map(|n| n as usize)
+        .unwrap_or(tightly);
     let count = usize_of(&accessor["count"])?;
     let data = blob
         .get(start..start + count * stride)
@@ -655,28 +1013,131 @@ mod tests {
 
     #[test]
     fn e1m1_fills_a_finite_cube_and_has_a_floor_under_the_start() {
-        let (chunk, spawn, _) = load_e1m1();
+        let map = load_e1m1();
+        let chunk = map.chunk;
+        let spawn = map.spawn;
         assert!(chunk.nodes.len() > 8);
         assert!(spawn.x.abs() < 1.0 && spawn.y.abs() < 1.0 && spawn.z.abs() < 1.0);
 
         let mut found = false;
-        for i in 1..EYE_HEIGHT + 8 {
-            let floor = Vector3::new(spawn.x, spawn.y - i as f32 * (2.0 / 8192.0), spawn.z);
+        let step = 2.0 / map.grid as f32;
+        for i in 1..EYE_HEIGHT + 16 {
+            let floor = Vector3::new(spawn.x, spawn.y - i as f32 * step, spawn.z);
             let (node, depth, _) = chunk.find_voxel(floor, None);
             if chunk.nodes[node].value != Voxel::new(0, 0, 0) {
-                assert_eq!(depth, 13, "a texel-sized voxel is depth 13 in the 8192 cube");
+                assert_eq!(
+                    depth,
+                    map.grid.trailing_zeros(),
+                    "a texel-sized voxel fills one leaf of the cube"
+                );
                 found = true;
                 break;
             }
         }
         assert!(found, "start should be standing over the map");
+        if map.walk {
+            assert!(
+                map.pictures.planes.len() > 50,
+                "things should be sprite planes"
+            );
+            assert!(
+                !map.pictures.guns.is_empty(),
+                "the pistol sprite should load"
+            );
+            assert!(
+                map.pictures.guns[0].frames.len() > 1,
+                "the pistol should have its firing frames"
+            );
+            assert!(
+                map.pictures.names.contains_key("BEXPA"),
+                "barrel explosions need the BEXP frames"
+            );
+            assert!(
+                map.pictures.doors.len() >= 8,
+                "each closed door keeps a plane on both faces, got {}",
+                map.pictures.doors.len()
+            );
+            assert!(
+                fits_body(&chunk, map.grid, spawn),
+                "the player start should be clear of the floor and the ceiling"
+            );
+            let (next, _, ground) = step_on_foot(
+                &chunk,
+                map.grid,
+                spawn,
+                Vector3::new(map.look.x, 0.0, map.look.z),
+                32.0,
+                0.0,
+                0.05,
+                false,
+                true,
+            );
+            assert!(ground, "a step from the start stays on the floor");
+            assert!(
+                (next.y - spawn.y).abs() < step * 4.0,
+                "walking should not drop through the floor"
+            );
+        }
 
         let mut world = World::bare(String::new());
         world.chunks.insert(0, chunk);
         world.generate_mip_tree(0);
-        assert_ne!(
-            world.chunks.get(&0).unwrap().top_mip,
-            Voxel::new(0, 0, 0)
+        assert_ne!(world.chunks.get(&0).unwrap().top_mip, Voxel::new(0, 0, 0));
+    }
+
+    #[test]
+    fn walks_up_a_step_and_stops_at_a_tall_wall() {
+        let grid = 128;
+        let depth = 7;
+        let mut tree = CpuOctree::new(0);
+        let solid = Voxel::new(80, 80, 80);
+        for x in 8..56 {
+            for z in 28..36 {
+                let top = if x >= 28 { 20 } else { 4 };
+                for y in 0..=top {
+                    let p = voxel_center([x, y, z], grid);
+                    tree.put_in_voxel(Vector3::new(p.x, p.y, p.z), solid, depth);
+                }
+            }
+        }
+        for y in 5..60 {
+            for z in 28..36 {
+                let p = voxel_center([52, y, z], grid);
+                tree.put_in_voxel(Vector3::new(p.x, p.y, p.z), solid, depth);
+            }
+        }
+        assert!(cell_solid(&tree, grid, 12, 4, 32));
+        assert!(!cell_solid(&tree, grid, 12, 8, 32));
+        assert!(cell_solid(&tree, grid, 32, 20, 32));
+
+        let eye_y = 4.5 + BODY_CLEAR + PLAYER_EYE;
+        let mut pos = voxel_to_world([16.0, eye_y, 32.0], grid);
+        let mut vy = 0.0;
+        let mut ground = true;
+        for _ in 0..40 {
+            let stepped = step_on_foot(
+                &tree,
+                grid,
+                pos,
+                Vector3::new(1.0, 0.0, 0.0),
+                200.0,
+                vy,
+                0.05,
+                false,
+                ground,
+            );
+            pos = stepped.0;
+            vy = stepped.1;
+            ground = stepped.2;
+        }
+        let eye = world_to_voxel(pos, grid);
+        assert!(eye[0] > 30.0, "crossed onto the step, x={}", eye[0]);
+        assert!(
+            eye[1] > eye_y + 10.0,
+            "climbed the 16-unit step, y={}",
+            eye[1]
         );
+        assert!(eye[0] < 40.0, "the tall wall stops the body, x={}", eye[0]);
+        assert!(ground, "standing on the step");
     }
 }
