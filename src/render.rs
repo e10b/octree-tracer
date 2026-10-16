@@ -15,11 +15,14 @@ pub struct Render {
     history_buffers: [wgpu::Buffer; 2],
     history_index: usize,
     history_valid: bool,
+    still_frames: u32,
     svgf: Svgf,
     g_illum: wgpu::TextureView,
     g_normal: wgpu::TextureView,
     g_albedo: wgpu::TextureView,
     g_moments: wgpu::TextureView,
+    normal_tex: wgpu::Texture,
+    albedo_tex: wgpu::Texture,
     previous_camera: [[f32; 4]; 4],
     blue_noise_view: wgpu::TextureView,
     path_uniform_buffer: wgpu::Buffer,
@@ -28,6 +31,33 @@ pub struct Render {
     pub path_bounces: u32,
     pub texture_emission: f32,
     pub temporal_history: f32,
+    /// À-trous passes. 0 leaves the temporally integrated sample unblurred.
+    pub spatial_passes: u32,
+    pub voxel_light: bool,
+    /// 1 keeps the internal frame. 2 and 3 divide that resolution.
+    pub render_scale: u32,
+    applied_render_scale: u32,
+    /// 1 traces lighting at every pixel. 2 and 3 keep one pixel per cell.
+    pub light_scale: u32,
+    /// Bounce rays averaged into each voxel write.
+    pub light_samples: u32,
+    light_buffer: wgpu::Buffer,
+    light_fold_layout: wgpu::BindGroupLayout,
+    light_fold_pipeline: wgpu::ComputePipeline,
+    light_key: Option<[u32; 5]>,
+    pub oidn_enabled: bool,
+    oidn: Option<crate::oidn_denoise::Denoiser>,
+    oidn_readback: [wgpu::Buffer; 3],
+    oidn_raw: wgpu::Texture,
+    oidn_raw_view: wgpu::TextureView,
+    oidn_history: wgpu::Texture,
+    oidn_history_view: wgpu::TextureView,
+    oidn_history_valid: bool,
+    oidn_blend_buffer: wgpu::Buffer,
+    oidn_blend_layout: wgpu::BindGroupLayout,
+    oidn_blend_pipeline: wgpu::RenderPipeline,
+    oidn_blend_binds: [wgpu::BindGroup; 2],
+    scene_tex: wgpu::Texture,
     scene_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
     upscale_layout: wgpu::BindGroupLayout,
@@ -60,7 +90,7 @@ impl Render {
             present_mode: wgpu::PresentMode::Fifo,
         };
         gpu.surface.configure(&gpu.device, &config);
-        let render_size = render_resolution(size);
+        let render_size = render_resolution(1);
 
         let shader = gpu
             .device
@@ -83,7 +113,7 @@ impl Render {
                     | wgpu::BufferUsages::COPY_SRC,
             });
 
-        let nodes = octree.expanded(10_000_000);
+        let nodes = octree.expanded(NODE_CAPACITY);
 
         let node_buffer = gpu
             .device
@@ -92,14 +122,85 @@ impl Render {
                 contents: bytemuck::cast_slice(&nodes),
                 usage: wgpu::BufferUsages::STORAGE | wgpu::BufferUsages::COPY_DST,
             });
+        let light_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("voxel light"),
+            size: NODE_CAPACITY as u64 * 4 * 4,
+            usage: wgpu::BufferUsages::STORAGE
+                | wgpu::BufferUsages::COPY_SRC
+                | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let light_fold_layout =
+            gpu.device
+                .create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+                    label: Some("voxel light fold"),
+                    entries: &[
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 0,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 1,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: true },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 2,
+                            visibility: wgpu::ShaderStages::COMPUTE,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Uniform,
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
+                    ],
+                });
+        let light_fold_shader = gpu
+            .device
+            .create_shader_module(&wgpu::ShaderModuleDescriptor {
+                label: Some("voxel light fold"),
+                source: wgpu::ShaderSource::Wgsl(include_str!("light_fold.wgsl").into()),
+            });
+        let light_fold_pipeline =
+            gpu.device
+                .create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+                    label: Some("voxel light fold"),
+                    layout: Some(&gpu.device.create_pipeline_layout(
+                        &wgpu::PipelineLayoutDescriptor {
+                            label: Some("voxel light fold"),
+                            bind_group_layouts: &[&light_fold_layout],
+                            push_constant_ranges: &[],
+                        },
+                    )),
+                    module: &light_fold_shader,
+                    entry_point: "main",
+                });
 
         let path_uniforms = PathUniforms {
             frame_index: 0,
-            max_bounces: 3,
+            max_bounces: 6,
             texture_emission: 4.0,
-            temporal_history: 0.95,
+            temporal_history: 0.0,
             history_valid: 0,
-            padding: [0; 3],
+            accumulate: 0,
+            still_frames: 1,
+            voxel_light: 1,
+            light_scale: 1,
+            light_samples: 4,
+            _pad0: 0,
+            _pad1: 0,
             previous_camera: [[0.0; 4]; 4],
         };
         let path_uniform_buffer =
@@ -179,13 +280,23 @@ impl Render {
                             },
                             count: None,
                         },
+                        wgpu::BindGroupLayoutEntry {
+                            binding: 6,
+                            visibility: wgpu::ShaderStages::FRAGMENT,
+                            ty: wgpu::BindingType::Buffer {
+                                ty: wgpu::BufferBindingType::Storage { read_only: false },
+                                has_dynamic_offset: false,
+                                min_binding_size: None,
+                            },
+                            count: None,
+                        },
                     ],
                     label: Some("main_bind_group_layout"),
                 });
 
         let g_illum = filter_target(&gpu.device, "SVGF illumination", render_size.width, render_size.height);
-        let g_normal = filter_target(&gpu.device, "SVGF normal", render_size.width, render_size.height);
-        let g_albedo = filter_target(&gpu.device, "SVGF albedo", render_size.width, render_size.height);
+        let (normal_tex, g_normal) = readable_target(&gpu.device, "SVGF normal", render_size.width, render_size.height);
+        let (albedo_tex, g_albedo) = readable_target(&gpu.device, "SVGF albedo", render_size.width, render_size.height);
         let g_moments = filter_target(&gpu.device, "SVGF moments", render_size.width, render_size.height);
         let svgf = Svgf::new(
             &gpu.device,
@@ -204,6 +315,7 @@ impl Render {
             &history_buffers,
             &path_uniform_buffer,
             &blue_noise_view,
+            &light_buffer,
         );
         // #endregion
 
@@ -253,11 +365,33 @@ impl Render {
                 multiview: None,
             });
 
-        let scene_view = scene_texture(
+        let (scene_tex, scene_view) = scene_texture(
             &gpu.device,
             SCENE_FORMAT,
             render_size.width,
             render_size.height,
+        );
+        let (oidn_raw, oidn_raw_view) =
+            oidn_sample_texture(&gpu.device, "OIDN frame", render_size.width, render_size.height);
+        let (oidn_history, oidn_history_view) = oidn_sample_texture(
+            &gpu.device,
+            "OIDN history",
+            render_size.width,
+            render_size.height,
+        );
+        let oidn_blend_buffer = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some("OIDN temporal blend"),
+            size: std::mem::size_of::<OidnBlendUniforms>() as u64,
+            usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+            mapped_at_creation: false,
+        });
+        let (oidn_blend_layout, oidn_blend_pipeline, oidn_blend_binds) = oidn_temporal_pass(
+            &gpu.device,
+            &oidn_raw_view,
+            &oidn_history_view,
+            &history_buffers,
+            &path_uniform_buffer,
+            &oidn_blend_buffer,
         );
         let depth_view = depth_texture(&gpu.device, render_size.width, render_size.height);
         let (upscale_layout, upscale_pipeline, upscale_bind) =
@@ -294,19 +428,45 @@ impl Render {
             history_buffers,
             history_index: 0,
             history_valid: false,
+            still_frames: 1,
             svgf,
             g_illum,
             g_normal,
             g_albedo,
             g_moments,
+            normal_tex,
+            albedo_tex,
             previous_camera: [[0.0; 4]; 4],
             blue_noise_view,
             path_uniform_buffer,
             path_uniforms,
             last_path_signature: None,
-            path_bounces: 3,
+            path_bounces: 6,
             texture_emission: 4.0,
-            temporal_history: 0.95,
+            temporal_history: 0.0,
+            spatial_passes: 0,
+            voxel_light: true,
+            render_scale: 1,
+            applied_render_scale: 1,
+            light_scale: 1,
+            light_samples: 4,
+            light_buffer,
+            light_fold_layout,
+            light_fold_pipeline,
+            light_key: None,
+            oidn_enabled: false,
+            oidn: crate::oidn_denoise::Denoiser::new(render_size.width, render_size.height),
+            oidn_readback: oidn_buffers(&gpu.device, render_size.width, render_size.height),
+            oidn_raw,
+            oidn_raw_view,
+            oidn_history,
+            oidn_history_view,
+            oidn_history_valid: false,
+            oidn_blend_buffer,
+            oidn_blend_layout,
+            oidn_blend_pipeline,
+            oidn_blend_binds,
+            scene_tex,
             scene_view,
             depth_view,
             upscale_layout,
@@ -331,13 +491,15 @@ impl Render {
             self.config.width = new_size.width;
             self.config.height = new_size.height;
             gpu.surface.configure(&gpu.device, &self.config);
-            self.render_size = render_resolution(new_size);
-            self.scene_view = scene_texture(
+            self.render_size = render_resolution(self.render_scale);
+            let (scene_tex, scene_view) = scene_texture(
                 &gpu.device,
                 SCENE_FORMAT,
                 self.render_size.width,
                 self.render_size.height,
             );
+            self.scene_tex = scene_tex;
+            self.scene_view = scene_view;
             self.depth_view =
                 depth_texture(&gpu.device, self.render_size.width, self.render_size.height);
             self.history_buffers = [
@@ -345,8 +507,8 @@ impl Render {
                 history_buffer(&gpu.device, self.render_size.width, self.render_size.height),
             ];
             let g_illum = filter_target(&gpu.device, "SVGF illumination", self.render_size.width, self.render_size.height);
-            let g_normal = filter_target(&gpu.device, "SVGF normal", self.render_size.width, self.render_size.height);
-            let g_albedo = filter_target(&gpu.device, "SVGF albedo", self.render_size.width, self.render_size.height);
+            let (normal_tex, g_normal) = readable_target(&gpu.device, "SVGF normal", self.render_size.width, self.render_size.height);
+            let (albedo_tex, g_albedo) = readable_target(&gpu.device, "SVGF albedo", self.render_size.width, self.render_size.height);
             let g_moments = filter_target(&gpu.device, "SVGF moments", self.render_size.width, self.render_size.height);
             self.svgf.resize(
                 &gpu.device,
@@ -361,6 +523,10 @@ impl Render {
             self.g_normal = g_normal;
             self.g_albedo = g_albedo;
             self.g_moments = g_moments;
+            self.normal_tex = normal_tex;
+            self.albedo_tex = albedo_tex;
+            self.oidn_readback = oidn_buffers(&gpu.device, self.render_size.width, self.render_size.height);
+            self.oidn = crate::oidn_denoise::Denoiser::new(self.render_size.width, self.render_size.height);
             self.main_bind_groups = history_bind_groups(
                 &gpu.device,
                 &self.main_bind_group_layout,
@@ -369,9 +535,36 @@ impl Render {
                 &self.history_buffers,
                 &self.path_uniform_buffer,
                 &self.blue_noise_view,
+                &self.light_buffer,
             );
             self.history_index = 0;
             self.history_valid = false;
+            let (oidn_raw, oidn_raw_view) = oidn_sample_texture(
+                &gpu.device,
+                "OIDN frame",
+                self.render_size.width,
+                self.render_size.height,
+            );
+            let (oidn_history, oidn_history_view) = oidn_sample_texture(
+                &gpu.device,
+                "OIDN history",
+                self.render_size.width,
+                self.render_size.height,
+            );
+            self.oidn_blend_binds = oidn_blend_bind_groups(
+                &gpu.device,
+                &self.oidn_blend_layout,
+                &oidn_raw_view,
+                &oidn_history_view,
+                &self.history_buffers,
+                &self.path_uniform_buffer,
+                &self.oidn_blend_buffer,
+            );
+            self.oidn_raw = oidn_raw;
+            self.oidn_raw_view = oidn_raw_view;
+            self.oidn_history = oidn_history;
+            self.oidn_history_view = oidn_history_view;
+            self.oidn_history_valid = false;
             self.upscale_bind = upscale_bind_group(
                 &gpu.device,
                 &self.upscale_layout,
@@ -496,6 +689,10 @@ impl Render {
             self.path_bounces,
             self.texture_emission.to_bits(),
             self.temporal_history.to_bits(),
+            self.spatial_passes,
+            u32::from(self.voxel_light),
+            self.light_scale,
+            self.light_samples,
         ]);
         let mut history_valid = self.history_valid;
         if self.last_path_signature.as_ref() == Some(&signature) {
@@ -505,11 +702,35 @@ impl Render {
             self.last_path_signature = Some(signature);
             history_valid = false;
         }
+        let camera_still = history_valid && self.previous_camera == self.uniforms.camera;
+        if camera_still {
+            self.still_frames = self.still_frames.saturating_add(1);
+        } else {
+            self.still_frames = 1;
+        }
         self.path_uniforms.max_bounces = self.path_bounces;
         self.path_uniforms.texture_emission = self.texture_emission;
         self.path_uniforms.temporal_history = self.temporal_history;
         self.path_uniforms.history_valid = history_valid as u32;
+        self.path_uniforms.accumulate = u32::from(camera_still && self.still_frames > 1);
+        self.path_uniforms.still_frames = self.still_frames;
+        self.path_uniforms.voxel_light = u32::from(self.voxel_light);
+        self.path_uniforms.light_scale = self.light_scale.max(1).min(3);
+        self.path_uniforms.light_samples = self.light_samples.max(1);
         self.path_uniforms.previous_camera = self.previous_camera;
+        let light_key = [
+            self.uniforms.sun_dir[0].to_bits(),
+            self.uniforms.sun_dir[1].to_bits(),
+            self.uniforms.sun_dir[2].to_bits(),
+            u32::from(self.uniforms.shadows),
+            self.texture_emission.to_bits(),
+        ];
+        if self.light_key != Some(light_key) {
+            if self.light_key.is_some() {
+                clear_light_buffer(gpu, &self.light_buffer);
+            }
+            self.light_key = Some(light_key);
+        }
 
         gpu.queue.write_buffer(
             &self.uniform_buffer,
@@ -525,11 +746,105 @@ impl Render {
         self.egui_platform.update_time(time);
     }
 
+    pub fn clear_all_voxel_light(&self, gpu: &Gpu) {
+        clear_light_buffer(gpu, &self.light_buffer);
+    }
+
+    pub fn copy_voxel_light(&self, gpu: &Gpu, copies: &[(u32, u32)]) {
+        if copies.is_empty() {
+            return;
+        }
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("voxel light inherit"),
+            });
+        self.dispatch_light_pairs(gpu, &mut encoder, copies, 1);
+        gpu.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    /// Add the eight children's samples into the parent that just became a leaf.
+    pub fn fold_voxel_light(&self, gpu: &Gpu, folds: &[(u32, u32)]) {
+        if folds.is_empty() {
+            return;
+        }
+        let mut encoder = gpu
+            .device
+            .create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                label: Some("voxel light fold"),
+            });
+        self.dispatch_light_pairs(gpu, &mut encoder, folds, 0);
+        gpu.queue.submit(std::iter::once(encoder.finish()));
+    }
+
+    fn dispatch_light_pairs(
+        &self,
+        gpu: &Gpu,
+        encoder: &mut wgpu::CommandEncoder,
+        pairs_in: &[(u32, u32)],
+        mode: u32,
+    ) {
+        if pairs_in.is_empty() {
+            return;
+        }
+        let mut pairs = Vec::with_capacity(pairs_in.len() * 2);
+        for &(parent, child) in pairs_in {
+            pairs.push(parent);
+            pairs.push(child);
+        }
+        let pairs_buffer = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("voxel light pairs"),
+            contents: bytemuck::cast_slice(&pairs),
+            usage: wgpu::BufferUsages::STORAGE,
+        });
+        let uniform = gpu.device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
+            label: Some("voxel light fold uniform"),
+            contents: bytemuck::cast_slice(&[
+                pairs_in.len() as u32,
+                NODE_CAPACITY as u32,
+                mode,
+                0u32,
+            ]),
+            usage: wgpu::BufferUsages::UNIFORM,
+        });
+        let bind_group = gpu.device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("voxel light fold"),
+            layout: &self.light_fold_layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: self.light_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: pairs_buffer.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        });
+        let mut pass = encoder.begin_compute_pass(&wgpu::ComputePassDescriptor {
+            label: Some("voxel light fold"),
+        });
+        pass.set_pipeline(&self.light_fold_pipeline);
+        pass.set_bind_group(0, &bind_group, &[]);
+        pass.dispatch((pairs_in.len() as u32 + 63) / 64, 1, 1);
+    }
+
     pub fn accumulated_samples(&self) -> u32 {
-        self.path_uniforms.frame_index.saturating_add(1)
+        self.still_frames
     }
 
     pub fn render(&mut self, gpu: &Gpu, window: &Window) -> Result<(), wgpu::SurfaceError> {
+        let scale = self.render_scale.max(1).min(3);
+        if scale != self.applied_render_scale {
+            self.render_scale = scale;
+            self.applied_render_scale = scale;
+            let size = self.size;
+            self.resize(gpu, size);
+        }
         let output = gpu.surface.get_current_texture()?;
         let size = window.inner_size();
 
@@ -576,8 +891,102 @@ impl Render {
             .create_command_encoder(&wgpu::CommandEncoderDescriptor {
                 label: Some("SVGF encoder"),
             });
-        self.svgf
-            .encode(&mut encoder, self.history_index ^ 1, &self.scene_view);
+        self.svgf.encode(
+            &mut encoder,
+            self.history_index ^ 1,
+            &self.scene_view,
+            self.spatial_passes,
+        );
+
+        let denoise_this_frame = self.oidn_enabled
+            && self.oidn.is_some()
+            && !self.uniforms.show_steps
+            && !self.uniforms.show_hits;
+        if denoise_this_frame {
+            self.copy_oidn_inputs(&mut encoder);
+            gpu.queue.submit(std::iter::once(encoder.finish()));
+            if let Some(bytes) = self.denoise_downloaded(gpu) {
+                let width = self.render_size.width;
+                let height = self.render_size.height;
+                gpu.queue.write_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &self.oidn_raw,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    &bytes,
+                    wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: std::num::NonZeroU32::new(width * 8),
+                        rows_per_image: None,
+                    },
+                    wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                let blend = OidnBlendUniforms {
+                    ready: u32::from(self.oidn_history_valid),
+                    width,
+                    height,
+                    pad: 0,
+                };
+                gpu.queue.write_buffer(
+                    &self.oidn_blend_buffer,
+                    0,
+                    bytemuck::bytes_of(&blend),
+                );
+                encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("sprite and upscale encoder"),
+                });
+                {
+                    let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
+                        label: Some("OIDN temporal blend"),
+                        color_attachments: &[wgpu::RenderPassColorAttachment {
+                            view: &self.scene_view,
+                            resolve_target: None,
+                            ops: wgpu::Operations {
+                                load: wgpu::LoadOp::Load,
+                                store: true,
+                            },
+                        }],
+                        depth_stencil_attachment: None,
+                    });
+                    render_pass.set_pipeline(&self.oidn_blend_pipeline);
+                    render_pass.set_bind_group(0, &self.oidn_blend_binds[self.history_index], &[]);
+                    render_pass.draw(0..4, 0..1);
+                }
+                encoder.copy_texture_to_texture(
+                    wgpu::ImageCopyTexture {
+                        texture: &self.scene_tex,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::ImageCopyTexture {
+                        texture: &self.oidn_history,
+                        mip_level: 0,
+                        origin: wgpu::Origin3d::ZERO,
+                        aspect: wgpu::TextureAspect::All,
+                    },
+                    wgpu::Extent3d {
+                        width,
+                        height,
+                        depth_or_array_layers: 1,
+                    },
+                );
+                self.oidn_history_valid = true;
+            } else {
+                self.oidn_history_valid = false;
+                encoder = gpu.device.create_command_encoder(&wgpu::CommandEncoderDescriptor {
+                    label: Some("sprite and upscale encoder"),
+                });
+            }
+        } else {
+            self.oidn_history_valid = false;
+        }
 
         if self.sprite_count > 0 || self.gun_count > 0 {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -667,6 +1076,72 @@ impl Render {
 
         Ok(())
     }
+
+    fn copy_oidn_inputs(&self, encoder: &mut wgpu::CommandEncoder) {
+        let width = self.render_size.width;
+        let height = self.render_size.height;
+        let textures = [&self.scene_tex, &self.albedo_tex, &self.normal_tex];
+        for (texture, buffer) in textures.iter().zip(self.oidn_readback.iter()) {
+            encoder.copy_texture_to_buffer(
+                wgpu::ImageCopyTexture {
+                    texture,
+                    mip_level: 0,
+                    origin: wgpu::Origin3d::ZERO,
+                    aspect: wgpu::TextureAspect::All,
+                },
+                wgpu::ImageCopyBuffer {
+                    buffer,
+                    layout: wgpu::ImageDataLayout {
+                        offset: 0,
+                        bytes_per_row: std::num::NonZeroU32::new(oidn_row_bytes(width)),
+                        rows_per_image: None,
+                    },
+                },
+                wgpu::Extent3d {
+                    width,
+                    height,
+                    depth_or_array_layers: 1,
+                },
+            );
+        }
+    }
+
+    fn denoise_downloaded(&mut self, gpu: &Gpu) -> Option<Vec<u8>> {
+        let mut mapped = 0usize;
+        for buffer in &self.oidn_readback {
+            let mapped_buffer = buffer.slice(..).map_async(wgpu::MapMode::Read);
+            gpu.device.poll(wgpu::Maintain::Wait);
+            if pollster::block_on(mapped_buffer).is_err() {
+                for buffer in &self.oidn_readback[..mapped] {
+                    buffer.unmap();
+                }
+                return None;
+            }
+            mapped += 1;
+        }
+        let width = self.render_size.width;
+        let height = self.render_size.height;
+        let row = oidn_row_bytes(width);
+        let downloaded: Vec<Vec<u8>> = self
+            .oidn_readback
+            .iter()
+            .map(|buffer| buffer.slice(..).get_mapped_range().to_vec())
+            .collect();
+        for buffer in &self.oidn_readback {
+            buffer.unmap();
+        }
+        let color = crate::oidn_denoise::unpack_rgb(&downloaded[0], width, height, row);
+        let albedo = crate::oidn_denoise::unpack_rgb(&downloaded[1], width, height, row);
+        let normal = crate::oidn_denoise::unpack_rgb(&downloaded[2], width, height, row);
+        let denoiser = self.oidn.as_mut()?;
+        match denoiser.denoise(width, height, &color, &albedo, &normal) {
+            Ok(rgb) => Some(crate::oidn_denoise::pack_rgba(&rgb)),
+            Err(err) => {
+                println!("OIDN filter failed: {err}");
+                None
+            }
+        }
+    }
 }
 
 const SPRITE_ATTRS: [wgpu::VertexAttribute; 3] =
@@ -691,14 +1166,13 @@ fn depth_state(write: bool, compare: wgpu::CompareFunction) -> wgpu::DepthStenci
     }
 }
 
-fn render_resolution(size: winit::dpi::PhysicalSize<u32>) -> winit::dpi::PhysicalSize<u32> {
-    let height = size.height.min(480).max(1);
-    let aspect_width =
-        (size.width as f64 * height as f64 / size.height.max(1) as f64).round() as u32;
-    // Even widths match conventional resolutions such as 854x480 and avoid an
-    // asymmetric last column when the image is upscaled.
-    let width = (aspect_width.max(1) + 1) & !1;
-    winit::dpi::PhysicalSize::new(width.max(2), height)
+fn render_resolution(scale: u32) -> winit::dpi::PhysicalSize<u32> {
+    // Vanilla Doom's framebuffer. 2x and 3x divide it. The window copies
+    // these texels with no filtering.
+    let divisor = scale.max(1);
+    let width = (320 / divisor).max(2);
+    let height = (200 / divisor).max(1);
+    winit::dpi::PhysicalSize::new(width, height)
 }
 
 fn replace_target(format: wgpu::TextureFormat) -> wgpu::ColorTargetState {
@@ -725,7 +1199,7 @@ fn scene_texture(
     format: wgpu::TextureFormat,
     width: u32,
     height: u32,
-) -> wgpu::TextureView {
+) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some("480p scene"),
         size: wgpu::Extent3d {
@@ -737,9 +1211,13 @@ fn scene_texture(
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC
+            | wgpu::TextureUsages::COPY_DST,
     });
-    texture.create_view(&wgpu::TextureViewDescriptor::default())
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
 }
 
 fn upscale_pass(
@@ -753,24 +1231,16 @@ fn upscale_pass(
     });
     let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
         label: Some("upscale layout"),
-        entries: &[
-            wgpu::BindGroupLayoutEntry {
-                binding: 0,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Texture {
-                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
-                    view_dimension: wgpu::TextureViewDimension::D2,
-                    multisampled: false,
-                },
-                count: None,
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
             },
-            wgpu::BindGroupLayoutEntry {
-                binding: 1,
-                visibility: wgpu::ShaderStages::FRAGMENT,
-                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
-                count: None,
-            },
-        ],
+            count: None,
+        }],
     });
     let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("upscale pipeline layout"),
@@ -820,25 +1290,13 @@ fn upscale_bind_group(
     layout: &wgpu::BindGroupLayout,
     scene_view: &wgpu::TextureView,
 ) -> wgpu::BindGroup {
-    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
-        label: Some("upscale sampler"),
-        mag_filter: wgpu::FilterMode::Linear,
-        min_filter: wgpu::FilterMode::Linear,
-        ..Default::default()
-    });
     device.create_bind_group(&wgpu::BindGroupDescriptor {
         label: Some("upscale bind group"),
         layout,
-        entries: &[
-            wgpu::BindGroupEntry {
-                binding: 0,
-                resource: wgpu::BindingResource::TextureView(scene_view),
-            },
-            wgpu::BindGroupEntry {
-                binding: 1,
-                resource: wgpu::BindingResource::Sampler(&sampler),
-            },
-        ],
+        entries: &[wgpu::BindGroupEntry {
+            binding: 0,
+            resource: wgpu::BindingResource::TextureView(scene_view),
+        }],
     })
 }
 
@@ -898,6 +1356,7 @@ struct Svgf {
     uniforms: [wgpu::Buffer; 5],
     binds: [[wgpu::BindGroup; 5]; 2],
     modulate_binds: [wgpu::BindGroup; 2],
+    raw_modulate: wgpu::BindGroup,
 }
 
 impl Svgf {
@@ -1022,6 +1481,7 @@ impl Svgf {
         );
         let modulate_binds =
             svgf_modulate_binds(device, &layout, &uniforms, &illumination, albedo);
+        let raw_modulate = raw_modulate_bind(device, &layout, &uniforms, illum, albedo);
         Self {
             layout,
             pipeline,
@@ -1032,6 +1492,7 @@ impl Svgf {
             uniforms,
             binds,
             modulate_binds,
+            raw_modulate,
         }
     }
 
@@ -1059,11 +1520,13 @@ impl Svgf {
         );
         let modulate_binds =
             svgf_modulate_binds(device, &self.layout, &uniforms, &illumination, albedo);
+        let raw_modulate = raw_modulate_bind(device, &self.layout, &uniforms, illum, albedo);
         self.views = views;
         self.illumination = illumination;
         self.uniforms = uniforms;
         self.binds = binds;
         self.modulate_binds = modulate_binds;
+        self.raw_modulate = raw_modulate;
     }
 
     fn encode(
@@ -1071,6 +1534,7 @@ impl Svgf {
         encoder: &mut wgpu::CommandEncoder,
         history_slot: usize,
         scene: &wgpu::TextureView,
+        spatial_passes: u32,
     ) {
         let labels = [
             "SVGF variance and à-trous stride 1",
@@ -1079,8 +1543,9 @@ impl Svgf {
             "SVGF à-trous stride 8",
             "SVGF à-trous stride 16",
         ];
-        for pass in 0..5 {
-            let target = if pass == 4 {
+        let passes = spatial_passes.min(5) as usize;
+        for pass in 0..passes {
+            let target = if pass + 1 == passes {
                 &self.illumination[history_slot]
             } else if pass % 2 == 0 {
                 &self.views[0]
@@ -1117,12 +1582,26 @@ impl Svgf {
             depth_stencil_attachment: None,
         });
         render_pass.set_pipeline(&self.modulate_pipeline);
-        render_pass.set_bind_group(0, &self.modulate_binds[history_slot], &[]);
+        let modulate = if passes == 0 {
+            &self.raw_modulate
+        } else {
+            &self.modulate_binds[history_slot]
+        };
+        render_pass.set_bind_group(0, modulate, &[]);
         render_pass.draw(0..4, 0..1);
     }
 }
 
 fn filter_target(device: &wgpu::Device, label: &str, width: u32, height: u32) -> wgpu::TextureView {
+    readable_target(device, label, width, height).1
+}
+
+fn readable_target(
+    device: &wgpu::Device,
+    label: &str,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
     let texture = device.create_texture(&wgpu::TextureDescriptor {
         label: Some(label),
         size: wgpu::Extent3d {
@@ -1134,9 +1613,220 @@ fn filter_target(device: &wgpu::Device, label: &str, width: u32, height: u32) ->
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: SCENE_FORMAT,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT
+            | wgpu::TextureUsages::TEXTURE_BINDING
+            | wgpu::TextureUsages::COPY_SRC,
     });
-    texture.create_view(&wgpu::TextureViewDescriptor::default())
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+fn oidn_sample_texture(
+    device: &wgpu::Device,
+    label: &str,
+    width: u32,
+    height: u32,
+) -> (wgpu::Texture, wgpu::TextureView) {
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some(label),
+        size: wgpu::Extent3d {
+            width: width.max(1),
+            height: height.max(1),
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: SCENE_FORMAT,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    (texture, view)
+}
+
+#[repr(C)]
+#[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
+struct OidnBlendUniforms {
+    ready: u32,
+    width: u32,
+    height: u32,
+    pad: u32,
+}
+
+fn oidn_temporal_pass(
+    device: &wgpu::Device,
+    current: &wgpu::TextureView,
+    history_color: &wgpu::TextureView,
+    history_buffers: &[wgpu::Buffer; 2],
+    path_uniforms: &wgpu::Buffer,
+    blend_uniforms: &wgpu::Buffer,
+) -> (
+    wgpu::BindGroupLayout,
+    wgpu::RenderPipeline,
+    [wgpu::BindGroup; 2],
+) {
+    let shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        label: Some("OIDN temporal blend"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("oidn_temporal.wgsl").into()),
+    });
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("OIDN temporal blend layout"),
+        entries: &[
+            texture_entry(0),
+            texture_entry(1),
+            storage_entry(2),
+            storage_entry(3),
+            uniform_entry(4),
+            uniform_entry(5),
+        ],
+    });
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("OIDN temporal blend pipeline layout"),
+        bind_group_layouts: &[&layout],
+        push_constant_ranges: &[],
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("OIDN temporal blend pipeline"),
+        layout: Some(&pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: "vs_main",
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: "fs_main",
+            targets: &[replace_target(SCENE_FORMAT)],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: 1,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        multiview: None,
+    });
+    let binds = oidn_blend_bind_groups(
+        device,
+        &layout,
+        current,
+        history_color,
+        history_buffers,
+        path_uniforms,
+        blend_uniforms,
+    );
+    (layout, pipeline, binds)
+}
+
+fn texture_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Texture {
+            sample_type: wgpu::TextureSampleType::Float { filterable: false },
+            view_dimension: wgpu::TextureViewDimension::D2,
+            multisampled: false,
+        },
+        count: None,
+    }
+}
+
+fn storage_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn uniform_entry(binding: u32) -> wgpu::BindGroupLayoutEntry {
+    wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    }
+}
+
+fn oidn_blend_bind_groups(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    current: &wgpu::TextureView,
+    history_color: &wgpu::TextureView,
+    history_buffers: &[wgpu::Buffer; 2],
+    path_uniforms: &wgpu::Buffer,
+    blend_uniforms: &wgpu::Buffer,
+) -> [wgpu::BindGroup; 2] {
+    let make = |previous: usize, current_history: usize| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("OIDN temporal blend bind group"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(current),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(history_color),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: history_buffers[previous].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: history_buffers[current_history].as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 4,
+                    resource: path_uniforms.as_entire_binding(),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 5,
+                    resource: blend_uniforms.as_entire_binding(),
+                },
+            ],
+        })
+    };
+    [make(0, 1), make(1, 0)]
+}
+
+fn oidn_buffers(device: &wgpu::Device, width: u32, height: u32) -> [wgpu::Buffer; 3] {
+    let row = oidn_row_bytes(width);
+    let size = row as u64 * height.max(1) as u64;
+    std::array::from_fn(|index| {
+        device.create_buffer(&wgpu::BufferDescriptor {
+            label: Some(["OIDN color", "OIDN albedo", "OIDN normal"][index]),
+            size,
+            usage: wgpu::BufferUsages::COPY_DST | wgpu::BufferUsages::MAP_READ,
+            mapped_at_creation: false,
+        })
+    })
+}
+
+fn oidn_row_bytes(width: u32) -> u32 {
+    let unpadded = width.max(1) * 8;
+    let align = wgpu::COPY_BYTES_PER_ROW_ALIGNMENT;
+    (unpadded + align - 1) & !(align - 1)
 }
 
 fn svgf_uniforms(device: &wgpu::Device, width: u32, height: u32) -> [wgpu::Buffer; 5] {
@@ -1269,6 +1959,21 @@ fn svgf_modulate_binds(
     groups.try_into().unwrap()
 }
 
+fn raw_modulate_bind(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    uniforms: &[wgpu::Buffer; 5],
+    illum: &wgpu::TextureView,
+    albedo: &wgpu::TextureView,
+) -> wgpu::BindGroup {
+    let entries = svgf_entries(&uniforms[0], illum, illum, illum, albedo, illum);
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("SVGF unfiltered remodulate"),
+        layout,
+        entries: &entries,
+    })
+}
+
 #[repr(C)]
 #[derive(Clone, Copy, bytemuck::Pod, bytemuck::Zeroable)]
 struct SvgfUniforms {
@@ -1296,6 +2001,7 @@ fn history_bind_groups(
     history_buffers: &[wgpu::Buffer; 2],
     path_uniform_buffer: &wgpu::Buffer,
     blue_noise_view: &wgpu::TextureView,
+    light_buffer: &wgpu::Buffer,
 ) -> [wgpu::BindGroup; 2] {
     let make = |previous: usize, current: usize| {
         device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -1325,6 +2031,10 @@ fn history_bind_groups(
                 wgpu::BindGroupEntry {
                     binding: 5,
                     resource: wgpu::BindingResource::TextureView(blue_noise_view),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 6,
+                    resource: light_buffer.as_entire_binding(),
                 },
             ],
         })
@@ -1514,8 +2224,28 @@ struct PathUniforms {
     texture_emission: f32,
     temporal_history: f32,
     history_valid: u32,
-    padding: [u32; 3],
+    accumulate: u32,
+    still_frames: u32,
+    voxel_light: u32,
+    light_scale: u32,
+    light_samples: u32,
+    _pad0: u32,
+    _pad1: u32,
     previous_camera: [[f32; 4]; 4],
+}
+
+const NODE_CAPACITY: usize = 10_000_000;
+
+fn clear_light_buffer(gpu: &Gpu, buffer: &wgpu::Buffer) {
+    let total = NODE_CAPACITY as u64 * 16;
+    let zeros = vec![0u32; 256 * 1024];
+    let bytes = bytemuck::cast_slice::<u32, u8>(&zeros);
+    let mut offset = 0u64;
+    while offset < total {
+        let n = ((total - offset) as usize).min(bytes.len());
+        gpu.queue.write_buffer(buffer, offset, &bytes[..n]);
+        offset += n as u64;
+    }
 }
 
 // For bool

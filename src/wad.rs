@@ -158,6 +158,382 @@ fn apply_brightmap_definitions(
     }
 }
 
+struct MaterialPaths {
+    normal: Option<String>,
+    metallic: Option<String>,
+    roughness: Option<String>,
+    ao: Option<String>,
+    glossiness: Option<f32>,
+}
+
+struct PbrTex {
+    normal: Option<Arc<image::RgbaImage>>,
+    metallic: Option<Arc<image::RgbaImage>>,
+    roughness: Option<Arc<image::RgbaImage>>,
+    ao: Option<Arc<image::RgbaImage>>,
+    glossiness: Option<f32>,
+}
+
+struct PbrPack {
+    materials: HashMap<String, PbrTex>,
+}
+
+impl PbrPack {
+    fn load(names: &std::collections::HashSet<String>) -> Self {
+        let Some(root) = find_pbr_dir() else {
+            println!("No DDS PBR pack found; walls stay matte");
+            return Self {
+                materials: HashMap::new(),
+            };
+        };
+        let Ok(text) = std::fs::read_to_string(root.join("GLDEFS")) else {
+            println!("PBR pack at {} has no GLDEFS", root.display());
+            return Self {
+                materials: HashMap::new(),
+            };
+        };
+        let defs = parse_gldefs(&text);
+        let mut cache: HashMap<String, Arc<image::RgbaImage>> = HashMap::new();
+        let mut materials = HashMap::new();
+        for name in names {
+            let Some(paths) = defs.get(&name.to_ascii_uppercase()) else {
+                continue;
+            };
+            let tex = PbrTex {
+                normal: load_cached(&root, &paths.normal, &mut cache)
+                    .map(|image| Arc::new(demean_tangent(&image))),
+                metallic: load_cached(&root, &paths.metallic, &mut cache),
+                roughness: load_cached(&root, &paths.roughness, &mut cache),
+                ao: load_cached(&root, &paths.ao, &mut cache),
+                glossiness: paths.glossiness,
+            };
+            if tex.normal.is_some()
+                || tex.roughness.is_some()
+                || tex.metallic.is_some()
+                || tex.glossiness.is_some()
+            {
+                materials.insert(name.to_ascii_uppercase(), tex);
+            }
+        }
+        println!(
+            "Loaded {} PBR materials from {}",
+            materials.len(),
+            root.display()
+        );
+        Self { materials }
+    }
+
+    fn get(&self, name: &str) -> Option<&PbrTex> {
+        self.materials.get(&name.to_ascii_uppercase())
+    }
+}
+
+fn find_pbr_dir() -> Option<std::path::PathBuf> {
+    let project = std::path::PathBuf::from(env!("CARGO_MANIFEST_DIR"));
+    let mut bases = Vec::new();
+    if let Ok(path) = std::env::var("DOOM_PBR_DIR") {
+        bases.push(std::path::PathBuf::from(path));
+    }
+    bases.push(project.join("files/dds_textures_pbr"));
+    bases.push(project.join("../.DDS_TexturesPBR_PLUS"));
+    bases.push(project.join("../DDS_TexturesPBR_PLUS"));
+    bases.into_iter().find(|base| base.join("GLDEFS").is_file() && base.join("materials").is_dir())
+}
+
+fn parse_gldefs(text: &str) -> HashMap<String, MaterialPaths> {
+    let mut out = HashMap::new();
+    let mut current: Option<(String, MaterialPaths)> = None;
+    for raw in text.lines() {
+        let line = raw.split("//").next().unwrap_or_default().trim();
+        if line.is_empty() {
+            continue;
+        }
+        if line.to_ascii_lowercase().starts_with("material ") {
+            if let Some((name, paths)) = current.take() {
+                out.insert(name, paths);
+            }
+            let mut words = line.split_whitespace();
+            words.next();
+            words.next();
+            let name = words
+                .next()
+                .unwrap_or_default()
+                .trim_matches('"')
+                .to_ascii_uppercase();
+            if !name.is_empty() {
+                current = Some((name, MaterialPaths::empty()));
+            }
+            continue;
+        }
+        if line.starts_with('}') {
+            if let Some((name, paths)) = current.take() {
+                out.insert(name, paths);
+            }
+            continue;
+        }
+        let Some((_, paths)) = current.as_mut() else {
+            continue;
+        };
+        if let Some(value) = gldef_value(line, "normal") {
+            paths.normal = Some(value);
+        } else if let Some(value) = gldef_value(line, "metallic") {
+            paths.metallic = Some(value);
+        } else if let Some(value) = gldef_value(line, "roughness") {
+            paths.roughness = Some(value);
+        } else if let Some(value) = gldef_value(line, "ao") {
+            paths.ao = Some(value);
+        } else if let Some(value) = gldef_value(line, "glossiness") {
+            paths.glossiness = value.parse().ok();
+        }
+    }
+    if let Some((name, paths)) = current.take() {
+        out.insert(name, paths);
+    }
+    out
+}
+
+impl MaterialPaths {
+    fn empty() -> Self {
+        Self {
+            normal: None,
+            metallic: None,
+            roughness: None,
+            ao: None,
+            glossiness: None,
+        }
+    }
+}
+
+fn gldef_value(line: &str, key: &str) -> Option<String> {
+    let mut words = line.split_whitespace();
+    if !words.next()?.eq_ignore_ascii_case(key) {
+        return None;
+    }
+    let value = words.next()?.trim_matches('"');
+    if value.is_empty() {
+        None
+    } else {
+        Some(value.replace('\\', "/"))
+    }
+}
+
+fn load_cached(
+    root: &std::path::Path,
+    path: &Option<String>,
+    cache: &mut HashMap<String, Arc<image::RgbaImage>>,
+) -> Option<Arc<image::RgbaImage>> {
+    let path = path.as_ref()?;
+    if path.to_ascii_lowercase().contains("blank") {
+        return None;
+    }
+    if let Some(image) = cache.get(path) {
+        return Some(Arc::clone(image));
+    }
+    let image = Arc::new(load_dds(&root.join(path))?);
+    cache.insert(path.clone(), Arc::clone(&image));
+    Some(image)
+}
+
+fn load_dds(path: &std::path::Path) -> Option<image::RgbaImage> {
+    let bytes = read_material(path)?;
+    decode_dds(&bytes)
+}
+
+fn read_material(path: &std::path::Path) -> Option<Vec<u8>> {
+    if let Ok(bytes) = std::fs::read(path) {
+        return Some(bytes);
+    }
+    let parent = path.parent()?;
+    let want = path.file_name()?.to_str()?;
+    let entry = std::fs::read_dir(parent).ok()?.flatten().find(|entry| {
+        entry
+            .file_name()
+            .to_str()
+            .map(|name| name.eq_ignore_ascii_case(want))
+            .unwrap_or(false)
+    })?;
+    std::fs::read(entry.path()).ok()
+}
+
+/// Top mip of an uncompressed BGRA or DXT1/3/5 DDS, nearest-reduced so a 2048
+/// map does not stay fully resident while the level is voxelized.
+fn decode_dds(bytes: &[u8]) -> Option<image::RgbaImage> {
+    if bytes.len() < 128 || &bytes[..4] != b"DDS " {
+        return None;
+    }
+    let height = u32::from_le_bytes(bytes[12..16].try_into().ok()?);
+    let width = u32::from_le_bytes(bytes[16..20].try_into().ok()?);
+    if width == 0 || height == 0 {
+        return None;
+    }
+    let fourcc = &bytes[84..88];
+    let full = if fourcc == b"DXT1" {
+        decode_dxt(&bytes[128..], width, height, 8)?
+    } else if fourcc == b"DXT3" || fourcc == b"DXT5" {
+        decode_dxt(&bytes[128..], width, height, 16)?
+    } else if fourcc == [0, 0, 0, 0] {
+        let bitcount = u32::from_le_bytes(bytes[88..92].try_into().ok()?);
+        if bitcount != 32 {
+            return None;
+        }
+        let pitch = u32::from_le_bytes(bytes[20..24].try_into().ok()?);
+        decode_bgra(&bytes[128..], width, height, pitch)?
+    } else {
+        return None;
+    };
+    Some(downsample_rgba(full, width, height))
+}
+
+fn decode_bgra(pixels: &[u8], width: u32, height: u32, pitch: u32) -> Option<Vec<u8>> {
+    let row = if pitch >= width.saturating_mul(4) {
+        pitch as usize
+    } else {
+        width as usize * 4
+    };
+    let needed = row.checked_mul(height as usize)?;
+    if pixels.len() < needed {
+        return None;
+    }
+    let mut rgba = vec![0u8; width as usize * height as usize * 4];
+    for y in 0..height as usize {
+        for x in 0..width as usize {
+            let src = y * row + x * 4;
+            let dst = (y * width as usize + x) * 4;
+            rgba[dst] = pixels[src + 2];
+            rgba[dst + 1] = pixels[src + 1];
+            rgba[dst + 2] = pixels[src];
+            rgba[dst + 3] = pixels[src + 3];
+        }
+    }
+    Some(rgba)
+}
+
+fn decode_dxt(pixels: &[u8], width: u32, height: u32, block_bytes: usize) -> Option<Vec<u8>> {
+    let blocks_x = (width as usize + 3) / 4;
+    let blocks_y = (height as usize + 3) / 4;
+    let needed = blocks_x.checked_mul(blocks_y)?.checked_mul(block_bytes)?;
+    if pixels.len() < needed {
+        return None;
+    }
+    let color_at = block_bytes - 8;
+    let mut rgba = vec![0u8; width as usize * height as usize * 4];
+    for by in 0..blocks_y {
+        for bx in 0..blocks_x {
+            let off = (by * blocks_x + bx) * block_bytes + color_at;
+            let colors = dxt_color_block(&pixels[off..off + 8]);
+            for py in 0..4 {
+                for px in 0..4 {
+                    let x = bx * 4 + px;
+                    let y = by * 4 + py;
+                    if x >= width as usize || y >= height as usize {
+                        continue;
+                    }
+                    let dst = (y * width as usize + x) * 4;
+                    rgba[dst..dst + 4].copy_from_slice(&colors[py * 4 + px]);
+                }
+            }
+        }
+    }
+    Some(rgba)
+}
+
+fn dxt_color_block(block: &[u8]) -> [[u8; 4]; 16] {
+    let c0 = u16::from_le_bytes([block[0], block[1]]);
+    let c1 = u16::from_le_bytes([block[2], block[3]]);
+    let bits = u32::from_le_bytes([block[4], block[5], block[6], block[7]]);
+    let a = expand565(c0);
+    let b = expand565(c1);
+    let mix = |left: [u8; 3], lw: u16, right: [u8; 3], rw: u16| {
+        [
+            ((left[0] as u16 * lw + right[0] as u16 * rw) / (lw + rw)) as u8,
+            ((left[1] as u16 * lw + right[1] as u16 * rw) / (lw + rw)) as u8,
+            ((left[2] as u16 * lw + right[2] as u16 * rw) / (lw + rw)) as u8,
+            255,
+        ]
+    };
+    let colors = if c0 > c1 {
+        [
+            [a[0], a[1], a[2], 255],
+            [b[0], b[1], b[2], 255],
+            mix(a, 2, b, 1),
+            mix(a, 1, b, 2),
+        ]
+    } else {
+        [
+            [a[0], a[1], a[2], 255],
+            [b[0], b[1], b[2], 255],
+            mix(a, 1, b, 1),
+            [0, 0, 0, 0],
+        ]
+    };
+    let mut out = [[0u8; 4]; 16];
+    for i in 0..16 {
+        out[i] = colors[((bits >> (2 * i)) & 3) as usize];
+    }
+    out
+}
+
+fn expand565(color: u16) -> [u8; 3] {
+    let r = ((color >> 11) & 31) as u8;
+    let g = ((color >> 5) & 63) as u8;
+    let b = (color & 31) as u8;
+    [
+        (r << 3) | (r >> 2),
+        (g << 2) | (g >> 4),
+        (b << 3) | (b >> 2),
+    ]
+}
+
+/// Drops a map-wide tangent lean so a biased normal becomes local bumps.
+fn demean_tangent(image: &image::RgbaImage) -> image::RgbaImage {
+    let count = (image.width() as u64) * (image.height() as u64);
+    if count == 0 {
+        return image.clone();
+    }
+    let mut sum_x = 0u64;
+    let mut sum_y = 0u64;
+    for pixel in image.pixels() {
+        sum_x += pixel[0] as u64;
+        sum_y += pixel[1] as u64;
+    }
+    let mean_x = (sum_x / count) as i32;
+    let mean_y = (sum_y / count) as i32;
+    let mut out = image.clone();
+    for pixel in out.pixels_mut() {
+        pixel[0] = (pixel[0] as i32 - mean_x + 128).clamp(0, 255) as u8;
+        pixel[1] = (pixel[1] as i32 - mean_y + 128).clamp(0, 255) as u8;
+    }
+    out
+}
+
+fn downsample_rgba(full: Vec<u8>, width: u32, height: u32) -> image::RgbaImage {
+    let max_side = 256u32;
+    let (out_w, out_h) = if width.max(height) <= max_side {
+        (width, height)
+    } else {
+        let scale = max_side as f32 / width.max(height) as f32;
+        (
+            ((width as f32 * scale).round() as u32).max(1),
+            ((height as f32 * scale).round() as u32).max(1),
+        )
+    };
+    if out_w == width && out_h == height {
+        return image::RgbaImage::from_raw(width, height, full)
+            .expect("rgba buffer matches the decoded size");
+    }
+    let mut rgba = vec![0u8; out_w as usize * out_h as usize * 4];
+    for y in 0..out_h {
+        let sy = (y as u64 * height as u64 / out_h as u64) as usize;
+        for x in 0..out_w {
+            let sx = (x as u64 * width as u64 / out_w as u64) as usize;
+            let src = (sy * width as usize + sx) * 4;
+            let dst = (y as usize * out_w as usize + x as usize) * 4;
+            rgba[dst..dst + 4].copy_from_slice(&full[src..src + 4]);
+        }
+    }
+    image::RgbaImage::from_raw(out_w, out_h, rgba).expect("rgba buffer matches the reduced size")
+}
+
 pub fn try_load_e1m1() -> Option<BuiltMap> {
     let path = find_wad()?;
     println!("Loading Doom from {}", path.display());
@@ -336,6 +712,7 @@ fn assemble(data: &[u8]) -> Result<BuiltMap, String> {
     }
     let gray = Arc::new(solid_image([96, 96, 96]));
     println!("Composed {} textures and flats", pictures.len());
+    let pbr = PbrPack::load(&needed);
 
     let min_x = verts.iter().map(|v| v.0).min().unwrap_or(0);
     let max_y = verts.iter().map(|v| v.1).max().unwrap_or(0);
@@ -394,6 +771,7 @@ fn assemble(data: &[u8]) -> Result<BuiltMap, String> {
             ceil_img.map(|img| img.as_ref()),
             brightmaps.flat(&sector.floor_flat),
             brightmaps.flat(&sector.ceil_flat),
+            &pbr,
             min_x,
             min_h,
             max_y,
@@ -411,6 +789,7 @@ fn assemble(data: &[u8]) -> Result<BuiltMap, String> {
             &pictures,
             &gray,
             &brightmaps,
+            &pbr,
             min_x,
             min_h,
             max_y,
@@ -1135,7 +1514,7 @@ fn sample_rgba(img: &image::RgbaImage, u: i32, v: i32) -> [u8; 4] {
         .0
 }
 
-fn shade(rgb: [u8; 3], light: i16, emission: u8) -> Voxel {
+fn shade(rgb: [u8; 3], light: i16, emission: u8, surface: Surface) -> Voxel {
     let factor = (light as f32 / 255.0).clamp(0.25, 1.0);
     let ch = |c: u8| {
         let v = (c as f32 * factor).round() as u8;
@@ -1145,7 +1524,128 @@ fn shade(rgb: [u8; 3], light: i16, emission: u8) -> Voxel {
             v
         }
     };
-    Voxel::with_emission(ch(rgb[0]), ch(rgb[1]), ch(rgb[2]), emission)
+    Voxel::surface(
+        ch(rgb[0]),
+        ch(rgb[1]),
+        ch(rgb[2]),
+        crate::octree::pack_emission(emission),
+        surface.roughness,
+        surface.metal,
+        surface.normal,
+    )
+}
+
+struct Surface {
+    roughness: u8,
+    metal: u8,
+    /// 0 uses the hit face. Anything else is the voxel's shading normal.
+    normal: u8,
+}
+
+struct Sampled {
+    roughness: u8,
+    metal: u8,
+    /// Tangent-space normal from the map. None keeps the surface direction.
+    tangent: Option<[f32; 3]>,
+}
+
+fn sample_map(map: &image::RgbaImage, u: i32, v: i32, src_w: i32, src_h: i32) -> [u8; 4] {
+    let src_w = src_w.max(1);
+    let src_h = src_h.max(1);
+    let x = (u.rem_euclid(src_w) as u32 * map.width() / src_w as u32).min(map.width() - 1);
+    let y = (v.rem_euclid(src_h) as u32 * map.height() / src_h as u32).min(map.height() - 1);
+    map.get_pixel(x, y).0
+}
+
+fn roughness_code(value: f32) -> u8 {
+    let value = value.clamp(0.0, 1.0);
+    if value < 0.34 {
+        1
+    } else if value < 0.67 {
+        2
+    } else {
+        3
+    }
+}
+
+fn normalize3(n: [f32; 3]) -> [f32; 3] {
+    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1.0e-8);
+    [n[0] / len, n[1] / len, n[2] / len]
+}
+
+/// Bakes the surface direction, plus the texel normal map, into one voxel normal.
+fn orient(normal: [f32; 3], tangent: [f32; 3], bitangent: [f32; 3], sampled: &Sampled) -> Surface {
+    let world = match sampled.tangent {
+        Some([x, y, z]) => normalize3([
+            tangent[0] * x + bitangent[0] * y + normal[0] * z,
+            tangent[1] * x + bitangent[1] * y + normal[1] * z,
+            tangent[2] * x + bitangent[2] * y + normal[2] * z,
+        ]),
+        None => normal,
+    };
+    Surface {
+        roughness: sampled.roughness,
+        metal: sampled.metal,
+        normal: crate::octree::pack_oct_normal(world),
+    }
+}
+
+/// Samples the pack's tangent-space normal, roughness, and metal at this texel.
+/// Missing maps leave the material matte. The caller still supplies the surface direction.
+fn surface_of(
+    src: &image::RgbaImage,
+    u: i32,
+    v: i32,
+    maps: Option<&PbrTex>,
+) -> (f32, Sampled) {
+    let Some(maps) = maps else {
+        return (1.0, Sampled { roughness: 0, metal: 0, tangent: None });
+    };
+    let src_w = src.width() as i32;
+    let src_h = src.height() as i32;
+    let tangent = maps.normal.as_ref().map(|normal| {
+        let pixel = sample_map(normal, u, v, src_w, src_h);
+        let nx = pixel[0] as f32 / 255.0 * 2.0 - 1.0;
+        let ny = pixel[1] as f32 / 255.0 * 2.0 - 1.0;
+        let nz = (pixel[2] as f32 / 255.0 * 2.0 - 1.0).max(0.05);
+        normalize3([nx, ny, nz])
+    });
+    let metal = maps
+        .metallic
+        .as_ref()
+        .map(|metallic| {
+            let pixel = sample_map(metallic, u, v, src_w, src_h);
+            if pixel[0] > 127 { 1 } else { 0 }
+        })
+        .unwrap_or(0);
+    let roughness = if let Some(rough) = &maps.roughness {
+        let pixel = sample_map(rough, u, v, src_w, src_h);
+        // The pack's roughness is often satin-dark. Lift dielectrics so a
+        // mid-grey texel does not become a tight highlight.
+        let mut value = pixel[0] as f32 / 255.0;
+        if metal == 0 {
+            value = value.sqrt();
+        }
+        roughness_code(value)
+    } else if let Some(gloss) = maps.glossiness {
+        let value = 1.0 - (gloss / 100.0).clamp(0.0, 1.0);
+        roughness_code(if metal == 0 { value.sqrt() } else { value })
+    } else if maps.normal.is_some() || maps.metallic.is_some() {
+        roughness_code(0.55)
+    } else {
+        0
+    };
+    let ao = maps
+        .ao
+        .as_ref()
+        .map(|ao| sample_map(ao, u, v, src_w, src_h)[0] as f32 / 255.0)
+        .unwrap_or(1.0)
+        .clamp(0.25, 1.0);
+    (ao, Sampled { roughness, metal, tangent })
+}
+
+fn shade_rgb(rgb: [u8; 3], ao: f32) -> [u8; 3] {
+    rgb.map(|channel| ((channel as f32 * ao).round() as u8).max(1))
 }
 
 fn sample_emission(
@@ -1184,6 +1684,7 @@ fn paint(
     rgb: [u8; 3],
     light: i16,
     emission: u8,
+    surface: Surface,
 ) {
     let x = wad_x - min_x;
     let y = height - min_h;
@@ -1191,7 +1692,7 @@ fn paint(
     if x < 0 || y < 0 || z < 0 || x >= grid || y >= grid || z >= grid {
         return;
     }
-    voxels.insert(pack(x, y, z), shade(rgb, light, emission));
+    voxels.insert(pack(x, y, z), shade(rgb, light, emission, surface));
 }
 
 fn pack(x: i32, y: i32, z: i32) -> u64 {
@@ -1205,6 +1706,7 @@ fn fill_sector(
     ceil_img: Option<&image::RgbaImage>,
     floor_brightmap: Option<&image::RgbaImage>,
     ceil_brightmap: Option<&image::RgbaImage>,
+    pbr: &PbrPack,
     min_x: i32,
     min_h: i32,
     max_y: i32,
@@ -1241,8 +1743,9 @@ fn fill_sector(
             while x < end {
                 let cx = x as f32 + 0.5;
                 if cx >= a && cx < b {
-                    let rgb = sample(floor_img, x, y);
                     let emission = sample_emission(floor_brightmap, floor_img, x, y);
+                    let (ao, sampled) = surface_of(floor_img, x, y, pbr.get(&sector.floor_flat));
+                    let rgb = shade_rgb(sample(floor_img, x, y), ao);
                     paint(
                         voxels,
                         grid,
@@ -1255,11 +1758,13 @@ fn fill_sector(
                         rgb,
                         sector.light,
                         emission,
+                        orient([0.0, 1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0], &sampled),
                     );
                     if !sky {
                         if let Some(ceil) = ceil_img {
-                            let rgb = sample(ceil, x, y);
                             let emission = sample_emission(ceil_brightmap, ceil, x, y);
+                            let (ao, sampled) = surface_of(ceil, x, y, pbr.get(&sector.ceil_flat));
+                            let rgb = shade_rgb(sample(ceil, x, y), ao);
                             paint(
                                 voxels,
                                 grid,
@@ -1272,6 +1777,7 @@ fn fill_sector(
                                 rgb,
                                 sector.light,
                                 emission,
+                                orient([0.0, -1.0, 0.0], [1.0, 0.0, 0.0], [0.0, 0.0, -1.0], &sampled),
                             );
                         }
                     }
@@ -1290,6 +1796,7 @@ fn draw_line(
     pictures: &HashMap<String, Arc<image::RgbaImage>>,
     gray: &Arc<image::RgbaImage>,
     brightmaps: &Brightmaps,
+    pbr: &PbrPack,
     min_x: i32,
     min_h: i32,
     max_y: i32,
@@ -1300,13 +1807,13 @@ fn draw_line(
     let left = side_sector(sides, line.left);
     if let Some(front) = right {
         draw_side(
-            line, true, front, left, sides, sectors, pictures, gray, brightmaps, min_x, min_h,
+            line, true, front, left, sides, sectors, pictures, gray, brightmaps, pbr, min_x, min_h,
             max_y, grid, voxels,
         );
     }
     if let Some(front) = left {
         draw_side(
-            line, false, front, right, sides, sectors, pictures, gray, brightmaps, min_x, min_h,
+            line, false, front, right, sides, sectors, pictures, gray, brightmaps, pbr, min_x, min_h,
             max_y, grid, voxels,
         );
     }
@@ -1322,6 +1829,7 @@ fn draw_side(
     pictures: &HashMap<String, Arc<image::RgbaImage>>,
     gray: &Arc<image::RgbaImage>,
     brightmaps: &Brightmaps,
+    pbr: &PbrPack,
     min_x: i32,
     min_h: i32,
     max_y: i32,
@@ -1380,6 +1888,7 @@ fn draw_side(
             xoff,
             yoff,
             light,
+            pbr.get(name),
             min_x,
             min_h,
             max_y,
@@ -1461,6 +1970,7 @@ fn paint_columns(
     xoff: i32,
     yoff: i32,
     light: i16,
+    maps: Option<&PbrTex>,
     min_x: i32,
     min_h: i32,
     max_y: i32,
@@ -1472,6 +1982,18 @@ fn paint_columns(
     }
     let len2 = (x1 - x0) * (x1 - x0) + (y1 - y0) * (y1 - y0);
     let len = len2.sqrt();
+    // The line is walked with the front sector on the right. That direction,
+    // not the cube face the ray happens to enter, is the wall's shading normal.
+    let (normal, tangent) = if len < 1.0e-4 {
+        ([0.0, 0.0, 1.0], [1.0, 0.0, 0.0])
+    } else {
+        let dx = (x1 - x0) / len;
+        let dy = (y1 - y0) / len;
+        let wad_nx = dy;
+        let wad_ny = -dx;
+        ([wad_nx, 0.0, -wad_ny], [dx, 0.0, -dy])
+    };
+    let bitangent = [0.0, 1.0, 0.0];
     for (cx, cy) in cells {
         let dist = if len2 < 1e-4 {
             0.0
@@ -1489,8 +2011,21 @@ fn paint_columns(
             }
             let rgb = [pixel[0], pixel[1], pixel[2]];
             let emission = sample_emission(brightmap, tex, u, v);
+            let (ao, sampled) = surface_of(tex, u, v, maps);
+            let rgb = shade_rgb(rgb, ao);
             paint(
-                voxels, grid, min_x, min_h, max_y, *cx, h, *cy, rgb, light, emission,
+                voxels,
+                grid,
+                min_x,
+                min_h,
+                max_y,
+                *cx,
+                h,
+                *cy,
+                rgb,
+                light,
+                emission,
+                orient(normal, tangent, bitangent, &sampled),
             );
         }
     }
@@ -1782,6 +2317,102 @@ mod tests {
     }
 
     #[test]
+    fn pbr_maps_set_tilt_roughness_and_metal() {
+        let mut normal = RgbaImage::new(2, 1);
+        normal.put_pixel(0, 0, Rgba([255, 128, 255, 255]));
+        normal.put_pixel(1, 0, Rgba([128, 128, 255, 255]));
+        let mut rough = RgbaImage::new(2, 1);
+        rough.put_pixel(0, 0, Rgba([0, 0, 0, 255]));
+        rough.put_pixel(1, 0, Rgba([255, 255, 255, 255]));
+        let mut metal = RgbaImage::new(2, 1);
+        metal.put_pixel(0, 0, Rgba([255, 255, 255, 255]));
+        metal.put_pixel(1, 0, Rgba([0, 0, 0, 255]));
+        let maps = super::PbrTex {
+            normal: Some(Arc::new(normal)),
+            metallic: Some(Arc::new(metal)),
+            roughness: Some(Arc::new(rough)),
+            ao: None,
+            glossiness: None,
+        };
+        let src = RgbaImage::new(2, 1);
+        let (ao, bumped) = super::surface_of(&src, 0, 0, Some(&maps));
+        assert_eq!(ao, 1.0);
+        assert_eq!(bumped.metal, 1);
+        assert_eq!(bumped.roughness, 1);
+        let wall = super::orient([0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], &bumped);
+        let leaned = crate::octree::unpack_oct_normal(wall.normal).unwrap();
+        assert!(leaned[0] > 0.4, "a bright red normal leans along the wall {:?}", leaned);
+        assert!(leaned[2] > 0.4, "{:?}", leaned);
+        let (_, flat) = super::surface_of(&src, 1, 0, Some(&maps));
+        assert_eq!(flat.metal, 0);
+        assert_eq!(flat.roughness, 3);
+        let straight = super::orient([0.0, 0.0, 1.0], [1.0, 0.0, 0.0], [0.0, 1.0, 0.0], &flat);
+        let n = crate::octree::unpack_oct_normal(straight.normal).unwrap();
+        assert!(n[2] > 0.9 && n[0].abs() < 0.2, "{:?}", n);
+    }
+
+    #[test]
+    fn gldefs_last_material_wins_and_ignores_comments() {
+        let defs = super::parse_gldefs(
+            r#"
+            material texture "DOOR3" {
+                normal "materials/normalmaps/auto/door3_n.dds"
+                roughness "materials/roughness/auto/door3_r.dds"
+            }
+            material texture "DOOR3" {
+                // normal "materials/normalmaps/auto/door3_n.dds"
+                glossiness 22
+            }
+            "#,
+        );
+        let door = defs.get("DOOR3").unwrap();
+        assert!(door.normal.is_none());
+        assert!(door.roughness.is_none());
+        assert_eq!(door.glossiness, Some(22.0));
+    }
+
+    #[test]
+    fn dds_bgra_swaps_to_rgba() {
+        let mut bytes = vec![0u8; 128 + 8];
+        bytes[..4].copy_from_slice(b"DDS ");
+        bytes[12..16].copy_from_slice(&1u32.to_le_bytes());
+        bytes[16..20].copy_from_slice(&2u32.to_le_bytes());
+        bytes[20..24].copy_from_slice(&8u32.to_le_bytes());
+        bytes[88..92].copy_from_slice(&32u32.to_le_bytes());
+        bytes[128..132].copy_from_slice(&[1, 2, 3, 4]);
+        bytes[132..136].copy_from_slice(&[5, 6, 7, 8]);
+        let image = super::decode_dds(&bytes).unwrap();
+        assert_eq!(image.get_pixel(0, 0).0, [3, 2, 1, 4]);
+        assert_eq!(image.get_pixel(1, 0).0, [7, 6, 5, 8]);
+    }
+
+    #[test]
+    fn demean_tangent_removes_a_constant_lean() {
+        let mut image = RgbaImage::new(2, 1);
+        image.put_pixel(0, 0, Rgba([40, 200, 255, 255]));
+        image.put_pixel(1, 0, Rgba([80, 220, 255, 255]));
+        let centered = super::demean_tangent(&image);
+        assert_eq!(centered.get_pixel(0, 0).0[0], 108);
+        assert_eq!(centered.get_pixel(1, 0).0[0], 148);
+        assert_eq!(centered.get_pixel(0, 0).0[2], 255);
+    }
+
+    #[test]
+    fn dxt1_block_decodes_endpoint_color() {
+        let mut bytes = vec![0u8; 128 + 8];
+        bytes[..4].copy_from_slice(b"DDS ");
+        bytes[12..16].copy_from_slice(&4u32.to_le_bytes());
+        bytes[16..20].copy_from_slice(&4u32.to_le_bytes());
+        bytes[84..88].copy_from_slice(b"DXT1");
+        // c0 white > c1 black, every index 0, so the block is the first endpoint.
+        bytes[128..130].copy_from_slice(&0xffffu16.to_le_bytes());
+        let image = super::decode_dds(&bytes).unwrap();
+        assert_eq!(image.dimensions(), (4, 4));
+        assert_eq!(image.get_pixel(0, 0).0, [255, 255, 255, 255]);
+        assert_eq!(image.get_pixel(3, 3).0, [255, 255, 255, 255]);
+    }
+
+    #[test]
     fn transparent_wall_texels_do_not_create_voxels() {
         let transparent = RgbaImage::new(1, 1);
         let mut voxels = HashMap::new();
@@ -1799,6 +2430,7 @@ mod tests {
             0,
             0,
             255,
+            None,
             0,
             0,
             0,

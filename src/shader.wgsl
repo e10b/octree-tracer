@@ -42,9 +42,14 @@ struct PathUniforms {
     texture_emission: f32;
     temporal_history: f32;
     history_valid: u32;
-    padding0: u32;
-    padding1: u32;
-    padding2: u32;
+    accumulate: u32;
+    still_frames: u32;
+    // 1: replace diffuse lighting with the voxel's running mean.
+    voxel_light: u32;
+    light_scale: u32;
+    light_samples: u32;
+    pad0: u32;
+    pad1: u32;
     previous_camera: mat4x4<f32>;
 };
 
@@ -62,6 +67,21 @@ var<uniform> path: PathUniforms;
 var<storage, read_write> history_out: History;
 [[group(0), binding(5)]]
 var blue_noise: texture_2d<f32>;
+// One record per node: rgb is the float irradiance mean, w is the sample count.
+struct VoxelLight {
+    data: [[stride(16)]] array<vec4<f32>>;
+};
+[[group(0), binding(6)]]
+var<storage, read_write> voxel_light: VoxelLight;
+
+var<private> light_leaf: array<u32, 6>;
+var<private> light_has: array<u32, 6>;
+var<private> light_direct: array<vec3<f32>, 6>;
+var<private> light_emit: array<vec3<f32>, 6>;
+var<private> light_albedo: array<vec3<f32>, 6>;
+var<private> light_spec: array<vec3<f32>, 6>;
+var<private> light_indirect: array<f32, 6>;
+var<private> light_added: array<vec3<f32>, 6>;
 
 
 let VOXEL_OFFSET = 134217728u;
@@ -392,44 +412,143 @@ fn sky_colour(dir: vec3<f32>) -> vec3<f32> {
 struct SceneHit {
     hit: bool;
     pos: vec3<f32>;
+    // Face the ray entered. Offsets and "into the cube" tests use this.
     normal: vec3<f32>;
+    // Stored voxel normal. Lighting uses this for every face of the voxel.
+    shade: vec3<f32>;
     albedo: vec3<f32>;
     steps: u32;
     hit_count: f32;
     emission: f32;
+    roughness: f32;
+    metal: f32;
+    // Octree node index. 0xffffffffu is a heightfield or miss, which has no record.
+    leaf: u32;
 };
+
+fn expand5(v: u32) -> f32 {
+    return f32((v << 3u) | (v >> 2u)) / 255.0;
+}
+
+fn expand6(v: u32) -> f32 {
+    return f32((v << 2u) | (v >> 4u)) / 255.0;
+}
+
+fn material_roughness(q: u32) -> f32 {
+    if (q == 0u) {
+        return 0.72;
+    }
+    if (q == 1u) {
+        return 0.28;
+    }
+    if (q == 2u) {
+        return 0.62;
+    }
+    return 0.96;
+}
+
+// Inverse of pack_oct_normal. code 0 is not a direction. 1..=6 are the axes.
+fn oct_normal(code: u32) -> vec3<f32> {
+    if (code == 1u) { return vec3<f32>(1.0, 0.0, 0.0); }
+    if (code == 2u) { return vec3<f32>(-1.0, 0.0, 0.0); }
+    if (code == 3u) { return vec3<f32>(0.0, 1.0, 0.0); }
+    if (code == 4u) { return vec3<f32>(0.0, -1.0, 0.0); }
+    if (code == 5u) { return vec3<f32>(0.0, 0.0, 1.0); }
+    if (code == 6u) { return vec3<f32>(0.0, 0.0, -1.0); }
+    let idx = code - 7u;
+    let u = f32(idx & 7u) / 7.0 * 2.0 - 1.0;
+    let v = f32(idx >> 3u) / 7.0 * 2.0 - 1.0;
+    var x = u;
+    var y = v;
+    var z = 1.0 - abs(u) - abs(v);
+    if (z < 0.0) {
+        let ox = x;
+        let oy = y;
+        var sx = 1.0;
+        if (ox < 0.0) { sx = -1.0; }
+        var sy = 1.0;
+        if (oy < 0.0) { sy = -1.0; }
+        x = (1.0 - abs(oy)) * sx;
+        y = (1.0 - abs(ox)) * sy;
+    }
+    return normalize(vec3<f32>(x, y, z));
+}
+
+fn d_ggx(n_dot_h: f32, alpha: f32) -> f32 {
+    let a2 = alpha * alpha;
+    let d = n_dot_h * n_dot_h * (a2 - 1.0) + 1.0;
+    return a2 / (3.14159265 * d * d);
+}
+
+fn vis_smith(n_dot_v: f32, n_dot_l: f32, alpha: f32) -> f32 {
+    let a2 = alpha * alpha;
+    let gv = n_dot_l * sqrt(n_dot_v * n_dot_v * (1.0 - a2) + a2);
+    let gl = n_dot_v * sqrt(n_dot_l * n_dot_l * (1.0 - a2) + a2);
+    return 0.5 / max(gv + gl, 0.0001);
+}
+
+fn fresnel_schlick(cos_theta: f32, f0: vec3<f32>) -> vec3<f32> {
+    return f0 + (vec3<f32>(1.0) - f0) * pow(1.0 - cos_theta, 5.0);
+}
+
+fn basis(normal: vec3<f32>) -> vec3<f32> {
+    var helper = vec3<f32>(0.0, 1.0, 0.0);
+    if (abs(normal.y) > 0.999) {
+        helper = vec3<f32>(1.0, 0.0, 0.0);
+    }
+    return normalize(cross(helper, normal));
+}
+
+fn to_world(normal: vec3<f32>, local: vec3<f32>) -> vec3<f32> {
+    let tangent = basis(normal);
+    let bitangent = cross(normal, tangent);
+    return normalize(tangent * local.x + normal * local.y + bitangent * local.z);
+}
 
 fn scene_ray(ray: Ray, primary: bool) -> SceneHit {
     let near = octree_ray(ray, primary);
     if (near.hit) {
         let value = node(near.value) - VOXEL_OFFSET;
-        let albedo = vec3<f32>(unpack_u8(value).yzw) / 255.0;
+        let albedo = vec3<f32>(
+            expand5((value >> 11u) & 31u),
+            expand6((value >> 5u) & 63u),
+            expand5(value & 31u),
+        );
         let hit_count = f32(n.data[near.value] & 15u) / 15.0;
-        let emission_code = (value >> 24u) & 7u;
+        let emission_code = (value >> 16u) & 3u;
         var emission = 0.0;
         if (emission_code > 1u) {
-            emission = f32(emission_code - 1u) / 6.0;
+            emission = f32(emission_code - 1u) / 2.0;
+        }
+        let normal_code = (value >> 21u) & 63u;
+        var shade = near.normal;
+        if (normal_code != 0u) {
+            shade = oct_normal(normal_code);
         }
         return SceneHit(
             true,
             near.pos,
             near.normal,
+            shade,
             albedo,
             near.steps,
             hit_count,
             emission,
+            material_roughness((value >> 19u) & 3u),
+            f32((value >> 18u) & 1u),
+            near.value,
         );
     }
 
     if (terrain_enabled()) {
         let far = heightfield_ray(near.pos, ray.dir);
         if (far.hit) {
-            return SceneHit(true, far.pos, far.normal, far.albedo, near.steps + far.steps, 0.0, 0.0);
+            return SceneHit(true, far.pos, far.normal, far.normal, far.albedo, near.steps + far.steps, 0.0, 0.0, 0.72, 0.0, 4294967295u);
         }
-        return SceneHit(false, far.pos, far.normal, far.albedo, near.steps + far.steps, 0.0, 0.0);
+        return SceneHit(false, far.pos, far.normal, far.normal, far.albedo, near.steps + far.steps, 0.0, 0.0, 0.72, 0.0, 4294967295u);
     }
 
-    return SceneHit(false, near.pos, near.normal, vec3<f32>(0.0), near.steps, 0.0, 0.0);
+    return SceneHit(false, near.pos, near.normal, near.normal, vec3<f32>(0.0), near.steps, 0.0, 0.0, 1.0, 0.0, 4294967295u);
 }
 
 fn hash_u32(value: u32) -> u32 {
@@ -452,14 +571,17 @@ fn cosine_hemisphere(normal: vec3<f32>, seed: u32) -> vec3<f32> {
     let phi = 6.28318530718 * r1;
     let radius = sqrt(r2);
     let local = vec3<f32>(cos(phi) * radius, sqrt(1.0 - r2), sin(phi) * radius);
+    return to_world(normal, local);
+}
 
-    var helper = vec3<f32>(0.0, 1.0, 0.0);
-    if (abs(normal.y) > 0.999) {
-        helper = vec3<f32>(1.0, 0.0, 0.0);
-    }
-    let tangent = normalize(cross(helper, normal));
-    let bitangent = cross(normal, tangent);
-    return normalize(tangent * local.x + normal * local.y + bitangent * local.z);
+fn sample_ggx(normal: vec3<f32>, roughness: f32, seed: u32) -> vec3<f32> {
+    let alpha = roughness * roughness;
+    let r1 = random_float(seed);
+    let r2 = random_float(seed ^ 0x68bc21ebu);
+    let phi = 6.28318530718 * r1;
+    let cos_theta = sqrt((1.0 - r2) / (1.0 + (alpha * alpha - 1.0) * r2));
+    let sin_theta = sqrt(max(0.0, 1.0 - cos_theta * cos_theta));
+    return to_world(normal, vec3<f32>(cos(phi) * sin_theta, cos_theta, sin(phi) * sin_theta));
 }
 
 fn sun_visible(pos: vec3<f32>, normal: vec3<f32>, sun_direction: vec3<f32>) -> bool {
@@ -481,10 +603,95 @@ struct PathSample {
     first_normal: vec3<f32>;
 };
 
-fn trace_path(camera_pos: vec3<f32>, camera_dir: vec3<f32>, seed: u32) -> PathSample {
+fn luminance(colour: vec3<f32>) -> f32 {
+    return dot(colour, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+// Stores this diffuse sample on the leaf. The pixel shows the mean from
+// before this sample, so one noisy path does not repaint a settled voxel.
+// The count stops growing at 64 and then each new ray replaces 1/64 of the
+// mean, so walking into a new room keeps updating instead of freezing.
+fn deposit_light(leaf: u32, sample_l: vec3<f32>) -> vec3<f32> {
+    if (path.voxel_light == 0u) {
+        return sample_l;
+    }
+    let rec = voxel_light.data[leaf];
+    let n_before = u32(rec.w);
+    if (n_before == 0u) {
+        voxel_light.data[leaf] = vec4<f32>(sample_l, 1.0);
+        return sample_l;
+    }
+    var n = n_before;
+    var mean = rec.xyz;
+    if (n > 64u) {
+        n = 64u;
+    }
+    if (n < 64u) {
+        n = n + 1u;
+        mean = mean + (sample_l - mean) / f32(n);
+    } else {
+        mean = mean + (sample_l - mean) * (1.0 / 64.0);
+    }
+    voxel_light.data[leaf] = vec4<f32>(mean, f32(n));
+    return rec.xyz;
+}
+
+// One bounce, read only. The four probes that feed a deposit must not write,
+// or they would race each other on the next leaf.
+fn sample_bounce(ray: Ray) -> vec3<f32> {
+    let hit = scene_ray(ray, false);
+    if (!hit.hit) {
+        return sky_colour(ray.dir) * 1.5;
+    }
+    let diffuse_albedo = hit.albedo * (1.0 - hit.metal);
+    let emitted = hit.albedo * (hit.emission * path.texture_emission);
+    if (hit.leaf != 4294967295u) {
+        let rec = voxel_light.data[hit.leaf];
+        if (rec.w > 0.0) {
+            return emitted + diffuse_albedo * rec.xyz;
+        }
+    }
+    let sun_direction = normalize(-u.sun_dir.xyz);
+    let n_dot_l = max(dot(hit.shade, sun_direction), 0.0);
+    var direct_l = vec3<f32>(0.0);
+    if (n_dot_l > 0.0 && sun_visible(hit.pos, hit.normal, sun_direction)) {
+        direct_l = vec3<f32>(2.4, 2.25, 2.0) * n_dot_l;
+    }
+    return emitted + diffuse_albedo * direct_l;
+}
+
+// The bounce budget ends by reading the next surface instead of dropping that
+// ray. A miss is sky. A hit is the light that voxel has already accumulated,
+// which is how a later bounce shows up without retracing it.
+fn terminal_radiance(ray: Ray) -> vec3<f32> {
+    let hit = scene_ray(ray, true);
+    if (!hit.hit) {
+        return sky_colour(ray.dir) * 1.5;
+    }
+    let diffuse_albedo = hit.albedo * (1.0 - hit.metal);
+    let emitted = hit.albedo * (hit.emission * path.texture_emission);
+    if (hit.leaf != 4294967295u) {
+        let rec = voxel_light.data[hit.leaf];
+        if (rec.w > 0.0) {
+            return emitted + diffuse_albedo * rec.xyz;
+        }
+    }
+    let sun_direction = normalize(-u.sun_dir.xyz);
+    let n_dot_l = max(dot(hit.shade, sun_direction), 0.0);
+    var direct_l = vec3<f32>(0.0);
+    if (n_dot_l > 0.0 && sun_visible(hit.pos, hit.normal, sun_direction)) {
+        direct_l = vec3<f32>(2.4, 2.25, 2.0) * n_dot_l;
+    }
+    if (hit.leaf != 4294967295u && luminance(diffuse_albedo) > 0.001) {
+        deposit_light(hit.leaf, direct_l);
+    }
+    return emitted + diffuse_albedo * direct_l;
+}
+
+fn trace_path(camera_pos: vec3<f32>, camera_dir: vec3<f32>, seed: u32, gather: bool) -> PathSample {
     var ray = Ray(camera_pos, camera_dir);
+    // Kept only so Russian roulette sees the same throughput as before.
     var throughput = vec3<f32>(1.0);
-    var radiance = vec3<f32>(0.0);
     var depth = 1000.0;
     var first_steps = 0u;
     var first_albedo = vec3<f32>(0.0);
@@ -492,14 +699,17 @@ fn trace_path(camera_pos: vec3<f32>, camera_dir: vec3<f32>, seed: u32) -> PathSa
     var first_hit_count = 0.0;
     var first_pos = vec3<f32>(0.0);
     var first_normal = vec3<f32>(0.0);
+    var incoming = vec3<f32>(0.0);
+    var count = 0u;
     var bounce = 0u;
 
     loop {
-        if (bounce >= path.max_bounces) { break; }
-        // The first indirect segment must refine geometry too. Otherwise portals
-        // outside the camera frustum remain represented by opaque coarse voxels,
-        // so bounced skylight can never discover them.
-        let hit = scene_ray(ray, bounce <= 1u);
+        // max_bounces is the number of bounces after the camera hit. 1 traces
+        // the wall you see and the surface the bounce lands on, and both store light.
+        if (bounce > path.max_bounces || bounce >= 6u) { break; }
+        // Every bounce may split the leaf it hits. Stopping after the camera
+        // ray keeps the detail on the screen and the light follows it.
+        let hit = scene_ray(ray, true);
         if (bounce == 0u) {
             first_steps = hit.steps;
             first_albedo = hit.albedo;
@@ -508,42 +718,180 @@ fn trace_path(camera_pos: vec3<f32>, camera_dir: vec3<f32>, seed: u32) -> PathSa
             if (hit.hit) {
                 depth = length(hit.pos - camera_pos);
                 first_pos = hit.pos;
-                first_normal = hit.normal;
+                first_normal = hit.shade;
             }
         }
 
         if (!hit.hit) {
-            radiance = radiance + throughput * sky_colour(ray.dir) * 1.5;
+            incoming = sky_colour(ray.dir) * 1.5;
             break;
         }
 
+        let shade_n = hit.shade;
+        let view = -ray.dir;
+        let alpha = hit.roughness * hit.roughness;
+        let f0 = mix(vec3<f32>(0.04), hit.albedo, hit.metal);
+        let diffuse_albedo = hit.albedo * (1.0 - hit.metal);
+        let spec_share = luminance(f0);
+        let diffuse_share = luminance(diffuse_albedo);
+        let p_spec = clamp(spec_share / max(spec_share + diffuse_share, 0.001), 0.0, 0.85);
         let emitted = hit.albedo * (hit.emission * path.texture_emission);
-        radiance = radiance + throughput * emitted;
 
         let sun_direction = normalize(-u.sun_dir.xyz);
-        let n_dot_l = max(dot(hit.normal, sun_direction), 0.0);
+        let n_dot_l = max(dot(shade_n, sun_direction), 0.0);
+        let n_dot_v = max(dot(shade_n, view), 0.001);
+        let sun_rgb = vec3<f32>(2.4, 2.25, 2.0);
+        var direct_l = vec3<f32>(0.0);
+        var spec_emit = emitted;
         if (n_dot_l > 0.0 && sun_visible(hit.pos, hit.normal, sun_direction)) {
-            let sun_radiance = vec3<f32>(2.4, 2.25, 2.0);
-            radiance = radiance + throughput * hit.albedo * sun_radiance * n_dot_l;
+            let half_sun = normalize(view + sun_direction);
+            let n_dot_h = max(dot(shade_n, half_sun), 0.0);
+            let fresnel = fresnel_schlick(max(dot(view, half_sun), 0.0), f0);
+            let spec = d_ggx(n_dot_h, alpha) * vis_smith(n_dot_v, n_dot_l, alpha) * fresnel;
+            let sun_radiance = sun_rgb * 3.14159265;
+            let diffuse_sun = diffuse_albedo * sun_rgb * n_dot_l;
+            let spec_sun = spec * sun_radiance * n_dot_l;
+            let sun_sum = diffuse_sun + spec_sun;
+            var sun_scale = 1.0;
+            let peak = max(max(sun_sum.x, sun_sum.y), sun_sum.z);
+            if (peak > 12.0) {
+                sun_scale = 12.0 / peak;
+            }
+            direct_l = sun_rgb * n_dot_l * sun_scale;
+            spec_emit = emitted + spec_sun * sun_scale;
         }
 
-        throughput = throughput * hit.albedo;
-        if (bounce >= 2u) {
-            let survive = clamp(max(max(throughput.x, throughput.y), throughput.z), 0.1, 0.95);
-            if (random_float(seed ^ hash_u32(bounce * 0x632be59bu)) > survive) {
-                break;
-            }
-            throughput = throughput / survive;
+        light_leaf[bounce] = hit.leaf;
+        light_has[bounce] = u32(hit.leaf != 4294967295u);
+        light_direct[bounce] = direct_l;
+        light_emit[bounce] = spec_emit;
+        light_albedo[bounce] = diffuse_albedo;
+        light_added[bounce] = vec3<f32>(0.0);
+
+        // Lighting scale 2 keeps one pixel of each 2x2, scale 3 one of each 3x3.
+        // The other pixels still find the surface and read the stored light.
+        if (!gather) {
+            light_spec[bounce] = vec3<f32>(0.0);
+            light_indirect[bounce] = 0.0;
+            count = bounce + 1u;
+            break;
         }
 
         let bounce_seed = hash_u32(seed ^ (bounce + 1u) * 0x9e3779b9u);
-        let next_dir = cosine_hemisphere(hit.normal, bounce_seed);
+        let spec_bounce = p_spec > 0.001 && random_float(bounce_seed) < p_spec;
+        var next_dir = vec3<f32>(0.0);
+        var spec_w = vec3<f32>(0.0);
+        var indirect_scale = 0.0;
+        if (spec_bounce) {
+            let half_vec = sample_ggx(shade_n, hit.roughness, bounce_seed ^ 0x632be59bu);
+            next_dir = reflect(-view, half_vec);
+            let spec_ndl = max(dot(shade_n, next_dir), 0.0);
+            let spec_ndh = max(dot(shade_n, half_vec), 0.001);
+            let spec_vdh = max(dot(view, half_vec), 0.001);
+            if (spec_ndl <= 0.0 || dot(next_dir, hit.normal) <= 0.05) {
+                light_spec[bounce] = vec3<f32>(0.0);
+                light_indirect[bounce] = 0.0;
+                count = bounce + 1u;
+                break;
+            }
+            let fresnel = fresnel_schlick(spec_vdh, f0);
+            let vis = vis_smith(n_dot_v, spec_ndl, alpha);
+            let weight = vis * fresnel * spec_ndl * 4.0 * spec_vdh / spec_ndh;
+            spec_w = clamp(weight, vec3<f32>(0.0), vec3<f32>(4.0)) / p_spec;
+            throughput = throughput * spec_w;
+        } else {
+            next_dir = cosine_hemisphere(shade_n, bounce_seed);
+            if (dot(next_dir, hit.normal) <= 0.05) {
+                next_dir = cosine_hemisphere(hit.normal, bounce_seed ^ 0x51ed270bu);
+            }
+            indirect_scale = 1.0 / max(1.0 - p_spec, 0.001);
+            throughput = throughput * diffuse_albedo * indirect_scale;
+            // The extra rays would be thrown away if each one stored itself,
+            // so they are averaged in the pixel and written once.
+            if (path.voxel_light != 0u) {
+                let samples = max(path.light_samples, 1u);
+                var probe_sum = vec3<f32>(0.0);
+                var s = 0u;
+                loop {
+                    if (s >= samples) { break; }
+                    let probe_seed = hash_u32(bounce_seed ^ (s + 1u) * 0x85ebca6bu);
+                    var probe_dir = cosine_hemisphere(shade_n, probe_seed);
+                    if (dot(probe_dir, hit.normal) <= 0.05) {
+                        probe_dir = cosine_hemisphere(hit.normal, probe_seed ^ 0x51ed270bu);
+                    }
+                    let origin = hit.pos + hit.normal * 0.000004 + probe_dir * 0.000004;
+                    probe_sum = probe_sum + sample_bounce(Ray(origin, probe_dir));
+                    s = s + 1u;
+                }
+                light_added[bounce] = probe_sum * (indirect_scale / f32(samples));
+            }
+        }
+        if (bounce >= 2u) {
+            let survive = clamp(max(max(throughput.x, throughput.y), throughput.z), 0.1, 0.95);
+            if (random_float(seed ^ hash_u32(bounce * 0x632be59bu)) > survive) {
+                light_spec[bounce] = vec3<f32>(0.0);
+                light_indirect[bounce] = 0.0;
+                count = bounce + 1u;
+                break;
+            }
+            spec_w = spec_w / survive;
+            indirect_scale = indirect_scale / survive;
+            throughput = throughput / survive;
+        }
+        light_spec[bounce] = spec_w;
+        light_indirect[bounce] = indirect_scale;
+        count = bounce + 1u;
         ray = Ray(hit.pos + hit.normal * 0.000004 + next_dir * 0.000004, next_dir);
         bounce = bounce + 1u;
     }
 
+    // The loop stops with one ray still in hand. Resolve it from the voxel
+    // cache or the sky so that bounce is stored on the surface it left.
+    if (path.voxel_light == 0u
+        && count > 0u
+        && light_indirect[count - 1u] > 0.0
+        && incoming.x == 0.0
+        && incoming.y == 0.0
+        && incoming.z == 0.0)
+    {
+        incoming = terminal_radiance(ray);
+    }
+
+    // Walk back to the camera. Each diffuse hit stores its sample and then
+    // shades with the mean, so later pixels and later views share the light.
+    var li = incoming;
+    loop {
+        if (count == 0u) { break; }
+        count = count - 1u;
+        var lit = light_direct[count];
+        if (path.voxel_light != 0u) {
+            lit = lit + light_added[count];
+        } else if (light_indirect[count] > 0.0) {
+            lit = lit + li * light_indirect[count];
+        }
+        var diffuse_out = light_albedo[count] * lit;
+        if (light_has[count] != 0u && luminance(light_albedo[count]) > 0.001) {
+            if (gather) {
+                diffuse_out = light_albedo[count] * deposit_light(light_leaf[count], lit);
+            } else {
+                let leaf = light_leaf[count];
+                let rec = voxel_light.data[leaf];
+                if (rec.w > 0.0) {
+                    diffuse_out = light_albedo[count] * rec.xyz;
+                }
+            }
+        }
+        // The random specular bounce is only here to carry light onto other
+        // voxels. The pixel keeps the direct highlight, which does not flicker.
+        var continuation = light_spec[count] * li;
+        if (path.voxel_light != 0u) {
+            continuation = vec3<f32>(0.0);
+        }
+        li = light_emit[count] + diffuse_out + continuation;
+    }
+
     return PathSample(
-        radiance,
+        li,
         depth,
         first_steps,
         first_albedo,
@@ -552,10 +900,6 @@ fn trace_path(camera_pos: vec3<f32>, camera_dir: vec3<f32>, seed: u32) -> PathSa
         first_pos,
         first_normal,
     );
-}
-
-fn luminance(colour: vec3<f32>) -> f32 {
-    return dot(colour, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
 
 fn history_matches(previous: HistoryPixel, pos: vec3<f32>, normal: vec3<f32>, depth: f32) -> bool {
@@ -630,7 +974,14 @@ fn fs_main(in: FSIn) -> FSOut {
     let dir = u.camera_inverse * vec4<f32>(clip_space.x, clip_space.y, 1.0, 1.0);
     let pos = pos.xyz / pos.w;
     let dir = normalize(dir.xyz / dir.w - pos);
-    let sample = trace_path(pos, dir, seed);
+    let scale = max(path.light_scale, 1u);
+    var gather = true;
+    if (path.voxel_light != 0u && scale > 1u) {
+        let cell = scale * scale;
+        let phase = path.frame_index % cell;
+        gather = (pixel.x % scale) == (phase % scale) && (pixel.y % scale) == (phase / scale);
+    }
+    let sample = trace_path(pos, dir, seed, gather);
     var sample_colour = sample.radiance;
 
     if (u.show_steps) {
@@ -653,7 +1004,17 @@ fn fs_main(in: FSIn) -> FSOut {
     var moment2 = noisy_luma * noisy_luma;
     var history_length = 1.0;
 
-    if (path.history_valid != 0u && sample.first_hit) {
+    if (path.accumulate != 0u) {
+        // The camera has not moved, so this pixel's earlier samples are the same
+        // ray. Average them all. Temporal reprojection is only for when it moves.
+        let count = max(f32(path.still_frames), 1.0);
+        let alpha = 1.0 / count;
+        let previous = history_in.data[pixel_index];
+        integrated = mix(previous.radiance.xyz, noisy_illumination, alpha);
+        moment1 = mix(previous.moments.x, noisy_luma, alpha);
+        moment2 = mix(previous.moments.y, noisy_luma * noisy_luma, alpha);
+        history_length = count;
+    } else if (path.history_valid != 0u && sample.first_hit && path.temporal_history > 0.0) {
         let previous_clip = path.previous_camera * vec4<f32>(sample.first_pos, 1.0);
         // create_proj_matrix is the renderer's inverse-ray basis rather than a
         // conventional homogeneous projection. Its transformed z is the

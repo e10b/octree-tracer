@@ -65,7 +65,186 @@ async fn probe() {
             concat!(include_str!("../src/common.wgsl"), include_str!("../src/shader.wgsl")).into(),
         ),
     });
-    drop(path_shader);
+    let storage = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Storage { read_only: false },
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let uniform = |binding| wgpu::BindGroupLayoutEntry {
+        binding,
+        visibility: wgpu::ShaderStages::FRAGMENT | wgpu::ShaderStages::VERTEX,
+        ty: wgpu::BindingType::Buffer {
+            ty: wgpu::BufferBindingType::Uniform,
+            has_dynamic_offset: false,
+            min_binding_size: None,
+        },
+        count: None,
+    };
+    let path_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("path layout"),
+        entries: &[
+            uniform(0),
+            storage(1),
+            storage(2),
+            uniform(3),
+            storage(4),
+            wgpu::BindGroupLayoutEntry {
+                binding: 5,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            storage(6),
+        ],
+    });
+    let path_pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("path pipeline"),
+        bind_group_layouts: &[&path_layout],
+        push_constant_ranges: &[],
+    });
+    let color_target = wgpu::ColorTargetState {
+        format: wgpu::TextureFormat::Rgba16Float,
+        blend: Some(wgpu::BlendState::REPLACE),
+        write_mask: wgpu::ColorWrites::ALL,
+    };
+    let _path_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("path pipeline"),
+        layout: Some(&path_pipeline_layout),
+        vertex: wgpu::VertexState {
+            module: &path_shader,
+            entry_point: "vs_main",
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &path_shader,
+            entry_point: "fs_main",
+            targets: &[
+                color_target.clone(),
+                color_target.clone(),
+                color_target.clone(),
+                color_target,
+            ],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            ..Default::default()
+        },
+        depth_stencil: Some(wgpu::DepthStencilState {
+            format: wgpu::TextureFormat::Depth32Float,
+            depth_write_enabled: true,
+            depth_compare: wgpu::CompareFunction::Always,
+            stencil: wgpu::StencilState::default(),
+            bias: wgpu::DepthBiasState::default(),
+        }),
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
+    let oidn_temporal = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        label: Some("OIDN temporal blend"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../src/oidn_temporal.wgsl").into()),
+    });
+    drop(oidn_temporal);
+    let fold_shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        label: Some("voxel light fold"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../src/light_fold.wgsl").into()),
+    });
+    let fold_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("voxel light fold"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: false },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Storage { read_only: true },
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::COMPUTE,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let _fold_pipeline = device.create_compute_pipeline(&wgpu::ComputePipelineDescriptor {
+        label: Some("voxel light fold"),
+        layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("voxel light fold"),
+            bind_group_layouts: &[&fold_layout],
+            push_constant_ranges: &[],
+        })),
+        module: &fold_shader,
+        entry_point: "main",
+    });
+    let blit_shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        label: Some("nearest blit"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("../src/blit.wgsl").into()),
+    });
+    let blit_layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("nearest blit"),
+        entries: &[wgpu::BindGroupLayoutEntry {
+            binding: 0,
+            visibility: wgpu::ShaderStages::FRAGMENT,
+            ty: wgpu::BindingType::Texture {
+                sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                view_dimension: wgpu::TextureViewDimension::D2,
+                multisampled: false,
+            },
+            count: None,
+        }],
+    });
+    let _blit_pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("nearest blit"),
+        layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("nearest blit"),
+            bind_group_layouts: &[&blit_layout],
+            push_constant_ranges: &[],
+        })),
+        vertex: wgpu::VertexState {
+            module: &blit_shader,
+            entry_point: "vs_main",
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &blit_shader,
+            entry_point: "fs_main",
+            targets: &[wgpu::ColorTargetState {
+                format: wgpu::TextureFormat::Bgra8Unorm,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            }],
+        }),
+        primitive: wgpu::PrimitiveState::default(),
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState::default(),
+        multiview: None,
+    });
 
     let width = 16u32;
     let height = 4u32;

@@ -500,6 +500,10 @@ impl World {
                 let mut divisor = 0.0;
                 let mut emission_levels = 0u32;
                 let mut has_authored_emission = false;
+                let mut roughness = 0.0;
+                let mut metal_count = 0.0;
+                let mut normal_sum = [0.0f32; 3];
+                let mut normal_count = 0.0f32;
 
                 for i in 0..8 {
                     let child = self.chunks.get(&id).unwrap().nodes[node.pointer as usize + i];
@@ -509,6 +513,16 @@ impl World {
                         if voxel.emission > 0 {
                             has_authored_emission = true;
                             emission_levels += voxel.emission.saturating_sub(1) as u32;
+                        }
+                        roughness += voxel.roughness as f32;
+                        if voxel.metal > 0 {
+                            metal_count += 1.0;
+                        }
+                        if let Some(normal) = crate::octree::unpack_oct_normal(voxel.normal) {
+                            normal_sum[0] += normal[0];
+                            normal_sum[1] += normal[1];
+                            normal_sum[2] += normal[2];
+                            normal_count += 1.0;
                         }
                         divisor += 1.0;
                     }
@@ -522,16 +536,34 @@ impl World {
                 // that full footprint so a small light does not illuminate an entire
                 // coarse octree brick when its leaves are not resident.
                 let emission = if has_authored_emission {
-                    1 + ((emission_levels / 8) as u8).min(6)
+                    1 + ((emission_levels / 8) as u8).min(2)
                 } else {
                     0
                 };
 
-                let voxel = Voxel::with_emission(
+                let roughness = if roughness == 0.0 {
+                    0
+                } else {
+                    (roughness / divisor).round().clamp(1.0, 3.0) as u8
+                };
+                let metal = if metal_count * 2.0 >= divisor { 1 } else { 0 };
+                let normal = if normal_count == 0.0 {
+                    0
+                } else {
+                    crate::octree::pack_oct_normal([
+                        normal_sum[0] / normal_count,
+                        normal_sum[1] / normal_count,
+                        normal_sum[2] / normal_count,
+                    ])
+                };
+                let voxel = Voxel::surface(
                     (colour.x as u8).max(1),
                     (colour.y as u8).max(1),
                     (colour.z as u8).max(1),
                     emission,
+                    roughness,
+                    metal,
+                    normal,
                 );
 
                 if i != 0 {

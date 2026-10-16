@@ -15,6 +15,7 @@ mod cpu_octree;
 mod doom;
 mod gpu;
 mod octree;
+mod oidn_denoise;
 mod play;
 mod procedural;
 mod render;

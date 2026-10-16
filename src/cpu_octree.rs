@@ -235,6 +235,8 @@ impl CpuOctree {
             nodes: Vec::new(),
             positions: Vec::new(),
             hole_stack: Vec::new(),
+            light_copies: Vec::new(),
+            light_folds: Vec::new(),
         };
 
         for i in 0..self.nodes.len() {

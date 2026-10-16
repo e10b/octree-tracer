@@ -1,0 +1,2 @@
+[env]
+OIDN_DIR = { value = "files/oidn-2.5.1.arm64.macos", relative = true }

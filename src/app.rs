@@ -174,6 +174,7 @@ impl App {
             self.gpu
                 .queue
                 .write_buffer(&self.render.node_buffer, 0, bytemuck::cast_slice(&nodes));
+            self.render.clear_all_voxel_light(&self.gpu);
         }
 
         if self.character.cursour_grabbed {
@@ -263,6 +264,10 @@ impl App {
             self.gpu
                 .queue
                 .write_buffer(&self.render.node_buffer, 0, bytemuck::cast_slice(&nodes));
+            let copies = std::mem::take(&mut self.octree.light_copies);
+            self.render.copy_voxel_light(&self.gpu, &copies);
+            let folds = std::mem::take(&mut self.octree.light_folds);
+            self.render.fold_voxel_light(&self.gpu, &folds);
         }
     }
 
@@ -319,6 +324,7 @@ impl App {
                                             0,
                                             bytemuck::cast_slice(&nodes),
                                         );
+                                        self.render.clear_all_voxel_light(&self.gpu);
 
                                         self.ui.error_string = "".to_string();
                                     }
@@ -350,6 +356,7 @@ impl App {
                                         0,
                                         bytemuck::cast_slice(&nodes),
                                     );
+                                    self.render.clear_all_voxel_light(&self.gpu);
 
                                     self.ui.error_string = "".to_string();
                                 }
@@ -395,6 +402,7 @@ impl App {
                                         0,
                                         bytemuck::cast_slice(&nodes),
                                     );
+                                    self.render.clear_all_voxel_light(&self.gpu);
 
                                     self.ui.error_string = "".to_string();
                                 }
@@ -435,7 +443,7 @@ impl App {
                     ui.checkbox(&mut self.render.uniforms.shadows, "Sun shadows");
                     ui.add(
                         egui::Slider::new(&mut self.render.path_bounces, 1..=6)
-                            .text("Path bounces"),
+                            .text("Bounces"),
                     );
                     ui.add(
                         egui::Slider::new(&mut self.render.texture_emission, 0.0..=100.0)
@@ -443,10 +451,31 @@ impl App {
                     );
                     ui.add(
                         egui::Slider::new(&mut self.render.temporal_history, 0.0..=0.99)
-                            .text("SVGF history"),
+                            .text("Temporal"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.render.spatial_passes, 0..=5).text("Spatial"),
+                    );
+                    ui.checkbox(&mut self.render.oidn_enabled, "OIDN");
+                    ui.checkbox(&mut self.render.voxel_light, "Voxel light");
+                    ui.horizontal(|ui| {
+                        ui.label("Render");
+                        ui.selectable_value(&mut self.render.render_scale, 1, "1x");
+                        ui.selectable_value(&mut self.render.render_scale, 2, "2x");
+                        ui.selectable_value(&mut self.render.render_scale, 3, "3x");
+                    });
+                    ui.horizontal(|ui| {
+                        ui.label("Lighting");
+                        ui.selectable_value(&mut self.render.light_scale, 1, "1x");
+                        ui.selectable_value(&mut self.render.light_scale, 2, "2x");
+                        ui.selectable_value(&mut self.render.light_scale, 3, "3x");
+                    });
+                    ui.add(
+                        egui::Slider::new(&mut self.render.light_samples, 1..=8)
+                            .text("Averaging"),
                     );
                     ui.label(format!(
-                        "Temporal frames: {}",
+                        "Frames: {}",
                         self.render.accumulated_samples()
                     ));
                     ui.checkbox(&mut self.render.uniforms.pause_adaptive, "Pause adaptive");

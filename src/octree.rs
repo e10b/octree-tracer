@@ -11,46 +11,160 @@ pub struct Voxel {
     pub b: u8,
     /// 0: no authored map, 1: mapped but dark, 2..=7: mapped emission intensity.
     pub emission: u8,
+    /// 0: unauthored (matte in the shader). 1..=7: smooth to rough.
+    pub roughness: u8,
+    /// 0 dielectric, 1 metal.
+    pub metal: u8,
+    /// Octahedral shading normal for the whole voxel. 0 uses the hit face.
+    pub normal: u8,
 }
 
 impl Voxel {
     pub fn new(r: u8, g: u8, b: u8) -> Voxel {
-        Voxel {
-            r,
-            g,
-            b,
-            emission: 0,
-        }
+        Voxel::surface(r, g, b, 0, 0, 0, 0)
     }
 
     pub fn with_emission(r: u8, g: u8, b: u8, emission: u8) -> Voxel {
+        Voxel::surface(r, g, b, emission, 0, 0, 0)
+    }
+
+    pub fn surface(
+        r: u8,
+        g: u8,
+        b: u8,
+        emission: u8,
+        roughness: u8,
+        metal: u8,
+        normal: u8,
+    ) -> Voxel {
         Voxel {
             r,
             g,
             b,
-            emission: emission.min(7),
+            emission: emission.min(3),
+            roughness: roughness.min(3),
+            metal: metal.min(1),
+            normal: normal.min(63),
         }
     }
 
     #[allow(dead_code)]
     pub fn from_value(value: u32) -> Voxel {
-        let r = (value >> 16) as u8;
-        let g = (value >> 8) as u8;
-        let b = value as u8;
-
-        Voxel::with_emission(r, g, b, ((value >> 24) & 7) as u8)
+        Voxel {
+            r: expand5((value >> 11) & 31),
+            g: expand6((value >> 5) & 63),
+            b: expand5(value & 31),
+            emission: ((value >> 16) & 3) as u8,
+            roughness: ((value >> 19) & 3) as u8,
+            metal: ((value >> 18) & 1) as u8,
+            normal: ((value >> 21) & 63) as u8,
+        }
     }
 
     pub fn to_value(&self) -> u32 {
         (VOXEL_OFFSET + self.to_cpu_value()) << 4
     }
 
+    /// 27-bit payload. The GPU word is `(VOXEL_OFFSET + payload) << 4`, so the
+    /// payload has to stay below 2^27 or it collides with a child pointer.
+    /// Colour is 5-6-5. Then 2-bit emission, metal, 2-bit roughness, and a
+    /// 6-bit octahedral normal. 0 in the normal field means "use the hit face".
     pub fn to_cpu_value(&self) -> u32 {
-        ((self.emission.min(7) as u32) << 24)
-            | (self.r as u32) << 16
-            | (self.g as u32) << 8
-            | self.b as u32
+        let r = (self.r as u32) >> 3;
+        let g = (self.g as u32) >> 2;
+        let b = (self.b as u32) >> 3;
+        b | (g << 5)
+            | (r << 11)
+            | ((self.emission.min(3) as u32) << 16)
+            | ((self.metal.min(1) as u32) << 18)
+            | ((self.roughness.min(3) as u32) << 19)
+            | ((self.normal.min(63) as u32) << 21)
     }
+}
+
+/// 0 none, 1 mapped dark, 2 mid, 3 bright. The brightmap sampler still speaks 0..=7.
+pub(crate) fn pack_emission(emission: u8) -> u8 {
+    match emission {
+        0 => 0,
+        1 => 1,
+        2..=4 => 2,
+        _ => 3,
+    }
+}
+
+const AXIS_NORMALS: [[f32; 3]; 6] = [
+    [1.0, 0.0, 0.0],
+    [-1.0, 0.0, 0.0],
+    [0.0, 1.0, 0.0],
+    [0.0, -1.0, 0.0],
+    [0.0, 0.0, 1.0],
+    [0.0, 0.0, -1.0],
+];
+
+/// Packs a unit direction into 1..=63. 0 is reserved for "no stored normal".
+/// Codes 1..=6 are the exact axes, so a flat floor or wall does not pick up a lean.
+pub fn pack_oct_normal(n: [f32; 3]) -> u8 {
+    let len = (n[0] * n[0] + n[1] * n[1] + n[2] * n[2]).sqrt().max(1.0e-8);
+    let x = n[0] / len;
+    let y = n[1] / len;
+    let z = n[2] / len;
+    if y.abs() > 0.98 && x.abs() < 0.15 && z.abs() < 0.15 {
+        return if y > 0.0 { 3 } else { 4 };
+    }
+    if x.abs() > 0.98 && y.abs() < 0.15 && z.abs() < 0.15 {
+        return if x > 0.0 { 1 } else { 2 };
+    }
+    if z.abs() > 0.98 && x.abs() < 0.15 && y.abs() < 0.15 {
+        return if z > 0.0 { 5 } else { 6 };
+    }
+    let inv = 1.0 / (x.abs() + y.abs() + z.abs());
+    let mut u = x * inv;
+    let mut v = y * inv;
+    if z <= 0.0 {
+        let ou = u;
+        let ov = v;
+        u = (1.0 - ov.abs()) * if ou >= 0.0 { 1.0 } else { -1.0 };
+        v = (1.0 - ou.abs()) * if ov >= 0.0 { 1.0 } else { -1.0 };
+    }
+    let quant = |s: f32| -> u32 {
+        ((s.clamp(-1.0, 1.0) * 0.5 + 0.5) * 7.0)
+            .round()
+            .clamp(0.0, 7.0) as u32
+    };
+    let idx = (quant(v) * 8 + quant(u)).min(56);
+    (idx + 7) as u8
+}
+
+/// Inverse of `pack_oct_normal`. `None` when the voxel should use the hit face.
+pub fn unpack_oct_normal(code: u8) -> Option<[f32; 3]> {
+    if code == 0 || code > 63 {
+        return None;
+    }
+    if code <= 6 {
+        return Some(AXIS_NORMALS[(code - 1) as usize]);
+    }
+    let idx = (code - 7) as u32;
+    let u = (idx & 7) as f32 / 7.0 * 2.0 - 1.0;
+    let v = (idx >> 3) as f32 / 7.0 * 2.0 - 1.0;
+    let mut x = u;
+    let mut y = v;
+    let mut z = 1.0 - u.abs() - v.abs();
+    if z < 0.0 {
+        let ox = x;
+        let oy = y;
+        x = (1.0 - oy.abs()) * if ox >= 0.0 { 1.0 } else { -1.0 };
+        y = (1.0 - ox.abs()) * if oy >= 0.0 { 1.0 } else { -1.0 };
+    }
+    let len = (x * x + y * y + z * z).sqrt().max(1.0e-8);
+    Some([x / len, y / len, z / len])
+}
+
+fn expand5(v: u32) -> u8 {
+    ((v << 3) | (v >> 2)) as u8
+}
+
+fn expand6(v: u32) -> u8 {
+    ((v << 2) | (v >> 4)) as u8
 }
 
 /// Layout (Outdated)
@@ -64,6 +178,12 @@ pub struct Octree {
     // stays on cpu
     pub positions: Vec<Vector3<f32>>,
     pub hole_stack: Vec<usize>,
+    /// (parent leaf, first child) pairs. The children start from the parent's
+    /// light and then refine it.
+    pub light_copies: Vec<(u32, u32)>,
+    /// (parent, first child) pairs from an unload. The children's radiance is
+    /// downsampled into the parent, which is a leaf again.
+    pub light_folds: Vec<(u32, u32)>,
 }
 
 impl Octree {
@@ -81,6 +201,8 @@ impl Octree {
             nodes,
             positions,
             hole_stack,
+            light_copies: Vec::new(),
+            light_folds: Vec::new(),
         }
     }
 
@@ -94,21 +216,23 @@ impl Octree {
         }
 
         let pos = self.positions[node];
-        if let Some(index) = self.hole_stack.pop() {
+        let child = if let Some(index) = self.hole_stack.pop() {
             self.nodes[node] = create_node(index);
-
             for i in 0..8 {
                 self.nodes[index + i] = mask[i].to_value();
                 self.positions[index + i] = pos + Octree::pos_offset(i, depth);
             }
+            index
         } else {
-            self.nodes[node] = create_node(self.nodes.len());
-
+            let index = self.nodes.len();
+            self.nodes[node] = create_node(index);
             for i in 0..8 {
                 self.nodes.push(mask[i].to_value());
                 self.positions.push(pos + Octree::pos_offset(i, depth));
             }
-        }
+            index
+        };
+        self.light_copies.push((node as u32, child as u32));
     }
 
     pub fn unsubdivide(&mut self, node: usize) {
@@ -119,6 +243,7 @@ impl Octree {
         }
 
         self.hole_stack.push(tnipt as usize);
+        self.light_folds.push((node as u32, tnipt));
 
         let pos = self.positions[node];
         if pos == Vector3::zero() {
@@ -234,8 +359,8 @@ impl std::fmt::Debug for Voxel {
     fn fmt(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(
             f,
-            "({}, {}, {}; emission {})",
-            self.r, self.g, self.b, self.emission
+            "({}, {}, {}; emission {}, rough {}, metal {}, normal {})",
+            self.r, self.g, self.b, self.emission, self.roughness, self.metal, self.normal
         )
     }
 }
@@ -246,8 +371,29 @@ mod tests {
 
     #[test]
     fn voxel_gpu_value_preserves_authored_emission() {
-        let voxel = Voxel::with_emission(12, 34, 56, 6);
-        let unpacked = Voxel::from_value(voxel.to_cpu_value());
-        assert_eq!(unpacked, voxel);
+        let voxel = Voxel::surface(12, 34, 56, 6, 3, 1, 45);
+        let cpu = voxel.to_cpu_value();
+        assert!(cpu < 1 << 27, "payload collided with the node tag");
+        assert_eq!(voxel.to_value() >> 4, super::VOXEL_OFFSET + cpu);
+        let unpacked = Voxel::from_value(cpu);
+        assert_eq!(unpacked.emission, 3);
+        assert_eq!(unpacked.roughness, 3);
+        assert_eq!(unpacked.metal, 1);
+        assert_eq!(unpacked.normal, 45);
+        assert_eq!(unpacked.r, super::expand5(12 >> 3));
+        assert_eq!(unpacked.g, super::expand6(34 >> 2));
+        assert_eq!(unpacked.b, super::expand5(56 >> 3));
+    }
+
+    #[test]
+    fn diagonal_normal_is_not_an_axis() {
+        let code = super::pack_oct_normal([1.0, 0.0, 1.0]);
+        let n = super::unpack_oct_normal(code).unwrap();
+        assert!(n[0] > 0.4 && n[2] > 0.4, "{n:?}");
+        assert!(n[1].abs() < 0.35, "{n:?}");
+        assert_eq!(super::pack_oct_normal([0.0, 1.0, 0.0]), 3);
+        assert_eq!(super::unpack_oct_normal(3), Some([0.0, 1.0, 0.0]));
+        assert_eq!(super::pack_oct_normal(n), code);
+        assert!(super::unpack_oct_normal(0).is_none());
     }
 }
