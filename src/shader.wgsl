@@ -569,12 +569,20 @@ fn random_float(seed: u32) -> f32 {
     return f32(hash_u32(seed)) * (1.0 / 4294967296.0);
 }
 
-fn cosine_hemisphere(normal: vec3<f32>, seed: u32) -> vec3<f32> {
-    let r1 = random_float(seed);
-    let r2 = random_float(seed ^ 0x9e3779b9u);
-    let phi = 6.28318530718 * r1;
+// Two blue-noise values for one hemisphere draw. The frame walks the tile so
+// the next deposit lands in a gap instead of reclumping the same directions.
+fn blue_disk(pixel: vec2<u32>, index: u32, slot: u32) -> vec2<f32> {
+    let x = i32((pixel.x + index * 19u + path.frame_index + slot * 7u) % 64u);
+    let y = i32((pixel.y + index * 13u + path.frame_index * 3u + slot) % 64u);
+    return textureLoad(blue_noise, vec2<i32>(x, y), 0).rg;
+}
+
+fn cosine_from_blue(normal: vec3<f32>, sample_index: u32, sample_count: u32, rg: vec2<f32>) -> vec3<f32> {
+    let width = f32(max(sample_count, 1u));
+    let r2 = (f32(sample_index) + rg.x) / width;
+    let phi = 6.28318530718 * rg.y;
     let radius = sqrt(r2);
-    let local = vec3<f32>(cos(phi) * radius, sqrt(1.0 - r2), sin(phi) * radius);
+    let local = vec3<f32>(cos(phi) * radius, sqrt(max(0.0, 1.0 - r2)), sin(phi) * radius);
     return to_world(normal, local);
 }
 
@@ -692,7 +700,7 @@ fn terminal_radiance(ray: Ray) -> vec3<f32> {
     return emitted + diffuse_albedo * direct_l;
 }
 
-fn trace_path(camera_pos: vec3<f32>, camera_dir: vec3<f32>, seed: u32, gather: bool) -> PathSample {
+fn trace_path(camera_pos: vec3<f32>, camera_dir: vec3<f32>, seed: u32, gather: bool, pixel: vec2<u32>) -> PathSample {
     var ray = Ray(camera_pos, camera_dir);
     // Kept only so Russian roulette sees the same throughput as before.
     var throughput = vec3<f32>(1.0);
@@ -804,9 +812,9 @@ fn trace_path(camera_pos: vec3<f32>, camera_dir: vec3<f32>, seed: u32, gather: b
             spec_w = clamp(weight, vec3<f32>(0.0), vec3<f32>(4.0)) / p_spec;
             throughput = throughput * spec_w;
         } else {
-            next_dir = cosine_hemisphere(shade_n, bounce_seed);
+            next_dir = cosine_from_blue(shade_n, bounce, 1u, blue_disk(pixel, bounce, 0u));
             if (dot(next_dir, hit.normal) <= 0.05) {
-                next_dir = cosine_hemisphere(hit.normal, bounce_seed ^ 0x51ed270bu);
+                next_dir = cosine_from_blue(shade_n, bounce, 1u, blue_disk(pixel, bounce, 3u));
             }
             indirect_scale = 1.0 / max(1.0 - p_spec, 0.001);
             throughput = throughput * diffuse_albedo * indirect_scale;
@@ -818,10 +826,10 @@ fn trace_path(camera_pos: vec3<f32>, camera_dir: vec3<f32>, seed: u32, gather: b
                 var s = 0u;
                 loop {
                     if (s >= samples) { break; }
-                    let probe_seed = hash_u32(bounce_seed ^ (s + 1u) * 0x85ebca6bu);
-                    var probe_dir = cosine_hemisphere(shade_n, probe_seed);
+                    let rg = blue_disk(pixel, bounce * 8u + s, 1u);
+                    var probe_dir = cosine_from_blue(shade_n, s, samples, rg);
                     if (dot(probe_dir, hit.normal) <= 0.05) {
-                        probe_dir = cosine_hemisphere(hit.normal, probe_seed ^ 0x51ed270bu);
+                        probe_dir = cosine_from_blue(shade_n, s, samples, blue_disk(pixel, bounce * 8u + s, 4u));
                     }
                     let origin = hit.pos + hit.normal * 0.000004 + probe_dir * 0.000004;
                     probe_sum = probe_sum + sample_bounce(Ray(origin, probe_dir));
@@ -993,7 +1001,7 @@ fn fs_main(in: FSIn) -> FSOut {
         let sub_dir_h = u.camera_inverse * vec4<f32>(sub_clip.x, sub_clip.y, 1.0, 1.0);
         ray_dir = normalize(sub_dir_h.xyz / sub_dir_h.w - pos);
     }
-    var sample = trace_path(pos, ray_dir, seed, gather);
+    var sample = trace_path(pos, ray_dir, seed, gather, pixel);
     if (fine) {
         var sum = sample.radiance;
         var s = 1u;
@@ -1007,7 +1015,7 @@ fn fs_main(in: FSIn) -> FSOut {
             let sub_dir_h = u.camera_inverse * vec4<f32>(sub_clip.x, sub_clip.y, 1.0, 1.0);
             let sub_dir = normalize(sub_dir_h.xyz / sub_dir_h.w - pos);
             let sub_seed = hash_u32(seed ^ (s * 0x85ebca6bu));
-            sum = sum + trace_path(pos, sub_dir, sub_seed, true).radiance;
+            sum = sum + trace_path(pos, sub_dir, sub_seed, true, pixel).radiance;
             s = s + 1u;
         }
         sample.radiance = sum * 0.25;
