@@ -34,13 +34,17 @@ pub struct Render {
     /// À-trous passes. 0 leaves the temporally integrated sample unblurred.
     pub spatial_passes: u32,
     pub voxel_light: bool,
-    /// 1 keeps the internal frame. 2 and 3 divide that resolution.
+    /// 0 doubles the internal frame. 1 keeps Doom's 320×200. 2 and 3 divide it.
     pub render_scale: u32,
     applied_render_scale: u32,
-    /// 1 traces lighting at every pixel. 2 and 3 keep one pixel per cell.
+    /// 0 gathers a 2×2 inside each pixel. 1 traces every pixel. 2 and 3 keep one pixel per cell.
     pub light_scale: u32,
     /// Bounce rays averaged into each voxel write.
     pub light_samples: u32,
+    /// 1 keeps the authored normal. 0 is the flat face.
+    pub normal_scale: f32,
+    /// Multiplier on every surface roughness.
+    pub roughness_scale: f32,
     light_buffer: wgpu::Buffer,
     light_fold_layout: wgpu::BindGroupLayout,
     light_fold_pipeline: wgpu::ComputePipeline,
@@ -199,8 +203,8 @@ impl Render {
             voxel_light: 1,
             light_scale: 1,
             light_samples: 4,
-            _pad0: 0,
-            _pad1: 0,
+            normal_scale: 1.0,
+            roughness_scale: 1.0,
             previous_camera: [[0.0; 4]; 4],
         };
         let path_uniform_buffer =
@@ -450,6 +454,8 @@ impl Render {
             applied_render_scale: 1,
             light_scale: 1,
             light_samples: 4,
+            normal_scale: 1.0,
+            roughness_scale: 1.0,
             light_buffer,
             light_fold_layout,
             light_fold_pipeline,
@@ -693,6 +699,8 @@ impl Render {
             u32::from(self.voxel_light),
             self.light_scale,
             self.light_samples,
+            self.normal_scale.to_bits(),
+            self.roughness_scale.to_bits(),
         ]);
         let mut history_valid = self.history_valid;
         if self.last_path_signature.as_ref() == Some(&signature) {
@@ -715,8 +723,13 @@ impl Render {
         self.path_uniforms.accumulate = u32::from(camera_still && self.still_frames > 1);
         self.path_uniforms.still_frames = self.still_frames;
         self.path_uniforms.voxel_light = u32::from(self.voxel_light);
-        self.path_uniforms.light_scale = self.light_scale.max(1).min(3);
+        self.path_uniforms.light_scale = match self.light_scale {
+            0 | 1 | 2 | 3 => self.light_scale,
+            _ => 1,
+        };
         self.path_uniforms.light_samples = self.light_samples.max(1);
+        self.path_uniforms.normal_scale = self.normal_scale;
+        self.path_uniforms.roughness_scale = self.roughness_scale;
         self.path_uniforms.previous_camera = self.previous_camera;
         let light_key = [
             self.uniforms.sun_dir[0].to_bits(),
@@ -838,7 +851,10 @@ impl Render {
     }
 
     pub fn render(&mut self, gpu: &Gpu, window: &Window) -> Result<(), wgpu::SurfaceError> {
-        let scale = self.render_scale.max(1).min(3);
+        let scale = match self.render_scale {
+            0 | 1 | 2 | 3 => self.render_scale,
+            _ => 1,
+        };
         if scale != self.applied_render_scale {
             self.render_scale = scale;
             self.applied_render_scale = scale;
@@ -1167,11 +1183,13 @@ fn depth_state(write: bool, compare: wgpu::CompareFunction) -> wgpu::DepthStenci
 }
 
 fn render_resolution(scale: u32) -> winit::dpi::PhysicalSize<u32> {
-    // Vanilla Doom's framebuffer. 2x and 3x divide it. The window copies
-    // these texels with no filtering.
-    let divisor = scale.max(1);
-    let width = (320 / divisor).max(2);
-    let height = (200 / divisor).max(1);
+    // 1x is Doom's 320×200. 0.5x doubles it. 2x and 3x divide it.
+    let (width, height) = match scale {
+        0 => (640, 400),
+        2 => (160, 100),
+        3 => (106, 66),
+        _ => (320, 200),
+    };
     winit::dpi::PhysicalSize::new(width, height)
 }
 
@@ -2229,8 +2247,8 @@ struct PathUniforms {
     voxel_light: u32,
     light_scale: u32,
     light_samples: u32,
-    _pad0: u32,
-    _pad1: u32,
+    normal_scale: f32,
+    roughness_scale: f32,
     previous_camera: [[f32; 4]; 4],
 }
 

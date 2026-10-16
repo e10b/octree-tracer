@@ -48,8 +48,8 @@ struct PathUniforms {
     voxel_light: u32;
     light_scale: u32;
     light_samples: u32;
-    pad0: u32;
-    pad1: u32;
+    normal_scale: f32;
+    roughness_scale: f32;
     previous_camera: mat4x4<f32>;
 };
 
@@ -523,7 +523,11 @@ fn scene_ray(ray: Ray, primary: bool) -> SceneHit {
         let normal_code = (value >> 21u) & 63u;
         var shade = near.normal;
         if (normal_code != 0u) {
-            shade = oct_normal(normal_code);
+            let mapped = oct_normal(normal_code);
+            let bent = near.normal + (mapped - near.normal) * path.normal_scale;
+            if (dot(bent, bent) > 0.0001) {
+                shade = normalize(bent);
+            }
         }
         return SceneHit(
             true,
@@ -534,7 +538,7 @@ fn scene_ray(ray: Ray, primary: bool) -> SceneHit {
             near.steps,
             hit_count,
             emission,
-            material_roughness((value >> 19u) & 3u),
+            clamp(material_roughness((value >> 19u) & 3u) * path.roughness_scale, 0.04, 1.0),
             f32((value >> 18u) & 1u),
             near.value,
         );
@@ -974,14 +978,40 @@ fn fs_main(in: FSIn) -> FSOut {
     let dir = u.camera_inverse * vec4<f32>(clip_space.x, clip_space.y, 1.0, 1.0);
     let pos = pos.xyz / pos.w;
     let dir = normalize(dir.xyz / dir.w - pos);
-    let scale = max(path.light_scale, 1u);
+    // 0 is a 2×2 lighting grid inside the pixel. 2 and 3 keep one pixel per cell.
+    let scale = path.light_scale;
     var gather = true;
     if (path.voxel_light != 0u && scale > 1u) {
         let cell = scale * scale;
         let phase = path.frame_index % cell;
         gather = (pixel.x % scale) == (phase % scale) && (pixel.y % scale) == (phase / scale);
     }
-    let sample = trace_path(pos, dir, seed, gather);
+    let fine = path.voxel_light != 0u && scale == 0u && !u.show_steps && !u.show_hits;
+    var ray_dir = dir;
+    if (fine) {
+        let sub_clip = get_clip_space(in.frag_pos + vec4<f32>(jitter.x - 0.25, jitter.y - 0.25, 0.0, 0.0), u.dimensions.xy);
+        let sub_dir_h = u.camera_inverse * vec4<f32>(sub_clip.x, sub_clip.y, 1.0, 1.0);
+        ray_dir = normalize(sub_dir_h.xyz / sub_dir_h.w - pos);
+    }
+    var sample = trace_path(pos, ray_dir, seed, gather);
+    if (fine) {
+        var sum = sample.radiance;
+        var s = 1u;
+        loop {
+            if (s >= 4u) { break; }
+            var ox = -0.25;
+            if ((s & 1u) == 1u) { ox = 0.25; }
+            var oy = -0.25;
+            if (s >= 2u) { oy = 0.25; }
+            let sub_clip = get_clip_space(in.frag_pos + vec4<f32>(jitter.x + ox, jitter.y + oy, 0.0, 0.0), u.dimensions.xy);
+            let sub_dir_h = u.camera_inverse * vec4<f32>(sub_clip.x, sub_clip.y, 1.0, 1.0);
+            let sub_dir = normalize(sub_dir_h.xyz / sub_dir_h.w - pos);
+            let sub_seed = hash_u32(seed ^ (s * 0x85ebca6bu));
+            sum = sum + trace_path(pos, sub_dir, sub_seed, true).radiance;
+            s = s + 1u;
+        }
+        sample.radiance = sum * 0.25;
+    }
     var sample_colour = sample.radiance;
 
     if (u.show_steps) {

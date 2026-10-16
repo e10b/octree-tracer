@@ -29,8 +29,8 @@ struct PathUniforms {
     voxel_light: u32;
     light_scale: u32;
     light_samples: u32;
-    pad0: u32;
-    pad1: u32;
+    normal_scale: f32;
+    roughness_scale: f32;
     previous_camera: mat4x4<f32>;
 };
 

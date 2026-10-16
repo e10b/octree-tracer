@@ -460,12 +460,14 @@ impl App {
                     ui.checkbox(&mut self.render.voxel_light, "Voxel light");
                     ui.horizontal(|ui| {
                         ui.label("Render");
+                        ui.selectable_value(&mut self.render.render_scale, 0, "0.5x");
                         ui.selectable_value(&mut self.render.render_scale, 1, "1x");
                         ui.selectable_value(&mut self.render.render_scale, 2, "2x");
                         ui.selectable_value(&mut self.render.render_scale, 3, "3x");
                     });
                     ui.horizontal(|ui| {
                         ui.label("Lighting");
+                        ui.selectable_value(&mut self.render.light_scale, 0, "0.5x");
                         ui.selectable_value(&mut self.render.light_scale, 1, "1x");
                         ui.selectable_value(&mut self.render.light_scale, 2, "2x");
                         ui.selectable_value(&mut self.render.light_scale, 3, "3x");
@@ -473,6 +475,14 @@ impl App {
                     ui.add(
                         egui::Slider::new(&mut self.render.light_samples, 1..=8)
                             .text("Averaging"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.render.normal_scale, 0.0..=2.0)
+                            .text("Normal"),
+                    );
+                    ui.add(
+                        egui::Slider::new(&mut self.render.roughness_scale, 0.0..=2.0)
+                            .text("Roughness"),
                     );
                     ui.label(format!(
                         "Frames: {}",
