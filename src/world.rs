@@ -498,8 +498,7 @@ impl World {
                 };
                 let mut colour = Vector3::new(0.0, 0.0, 0.0);
                 let mut divisor = 0.0;
-                let mut emission_levels = 0u32;
-                let mut has_authored_emission = false;
+                let mut emission = 0.0;
                 let mut roughness = 0.0;
                 let mut metal_count = 0.0;
                 let mut normal_sum = [0.0f32; 3];
@@ -510,10 +509,13 @@ impl World {
                     if child.value != Voxel::new(0, 0, 0) {
                         let voxel = child.value;
                         colour += Vector3::new(voxel.r as f32, voxel.g as f32, voxel.b as f32);
-                        if voxel.emission > 0 {
-                            has_authored_emission = true;
-                            emission_levels += voxel.emission.saturating_sub(1) as u32;
-                        }
+                        // Shader emits 0, 0, 0.5, 1 for codes 0..=3. Average that
+                        // energy over the same occupied children as the colour.
+                        emission += match voxel.emission {
+                            3 => 1.0,
+                            2 => 0.5,
+                            _ => 0.0,
+                        };
                         roughness += voxel.roughness as f32;
                         if voxel.metal > 0 {
                             metal_count += 1.0;
@@ -532,13 +534,15 @@ impl World {
                     continue;
                 }
                 colour /= divisor;
-                // A mip voxel covers all eight child cells. Average emissive energy over
-                // that full footprint so a small light does not illuminate an entire
-                // coarse octree brick when its leaves are not resident.
-                let emission = if has_authored_emission {
-                    1 + ((emission_levels / 8) as u8).min(2)
-                } else {
-                    0
+                let emission = {
+                    let mean = emission / divisor;
+                    if mean >= 0.75 {
+                        3
+                    } else if mean >= 0.25 {
+                        2
+                    } else {
+                        0
+                    }
                 };
 
                 let roughness = if roughness == 0.0 {

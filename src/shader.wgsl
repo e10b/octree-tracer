@@ -619,6 +619,30 @@ fn luminance(colour: vec3<f32>) -> f32 {
     return dot(colour, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
 
+// The eight children of one parent sit on an 8-aligned index. A leaf borrows
+// their light, weighted by how many samples each one holds. Its own record
+// still stores only its own samples.
+fn sibling_light(leaf: u32) -> vec4<f32> {
+    let base = leaf & 0xfffffff8u;
+    var acc = vec3<f32>(0.0);
+    var weight = 0.0;
+    var i = 0u;
+    loop {
+        if (i >= 8u) { break; }
+        let index = base + i;
+        let rec = voxel_light.data[index];
+        if (rec.w > 0.0 && node(index) >= VOXEL_OFFSET) {
+            acc = acc + rec.xyz * rec.w;
+            weight = weight + rec.w;
+        }
+        i = i + 1u;
+    }
+    if (weight <= 0.0) {
+        return vec4<f32>(0.0);
+    }
+    return vec4<f32>(acc / weight, 1.0);
+}
+
 // Stores this diffuse sample on the leaf. The pixel shows the mean from
 // before this sample, so one noisy path does not repaint a settled voxel.
 // The count stops growing at 64 and then each new ray replaces 1/64 of the
@@ -631,6 +655,10 @@ fn deposit_light(leaf: u32, sample_l: vec3<f32>) -> vec3<f32> {
     let n_before = u32(rec.w);
     if (n_before == 0u) {
         voxel_light.data[leaf] = vec4<f32>(sample_l, 1.0);
+        let shared = sibling_light(leaf);
+        if (shared.w > 0.0) {
+            return shared.xyz;
+        }
         return sample_l;
     }
     var n = n_before;
@@ -645,6 +673,10 @@ fn deposit_light(leaf: u32, sample_l: vec3<f32>) -> vec3<f32> {
         mean = mean + (sample_l - mean) * (1.0 / 64.0);
     }
     voxel_light.data[leaf] = vec4<f32>(mean, f32(n));
+    let shared = sibling_light(leaf);
+    if (shared.w > 0.0) {
+        return shared.xyz;
+    }
     return rec.xyz;
 }
 
@@ -658,9 +690,9 @@ fn sample_bounce(ray: Ray) -> vec3<f32> {
     let diffuse_albedo = hit.albedo * (1.0 - hit.metal);
     let emitted = hit.albedo * (hit.emission * path.texture_emission);
     if (hit.leaf != 4294967295u) {
-        let rec = voxel_light.data[hit.leaf];
-        if (rec.w > 0.0) {
-            return emitted + diffuse_albedo * rec.xyz;
+        let shared = sibling_light(hit.leaf);
+        if (shared.w > 0.0) {
+            return emitted + diffuse_albedo * shared.xyz;
         }
     }
     let sun_direction = normalize(-u.sun_dir.xyz);
@@ -683,9 +715,9 @@ fn terminal_radiance(ray: Ray) -> vec3<f32> {
     let diffuse_albedo = hit.albedo * (1.0 - hit.metal);
     let emitted = hit.albedo * (hit.emission * path.texture_emission);
     if (hit.leaf != 4294967295u) {
-        let rec = voxel_light.data[hit.leaf];
-        if (rec.w > 0.0) {
-            return emitted + diffuse_albedo * rec.xyz;
+        let shared = sibling_light(hit.leaf);
+        if (shared.w > 0.0) {
+            return emitted + diffuse_albedo * shared.xyz;
         }
     }
     let sun_direction = normalize(-u.sun_dir.xyz);
@@ -887,9 +919,9 @@ fn trace_path(camera_pos: vec3<f32>, camera_dir: vec3<f32>, seed: u32, gather: b
                 diffuse_out = light_albedo[count] * deposit_light(light_leaf[count], lit);
             } else {
                 let leaf = light_leaf[count];
-                let rec = voxel_light.data[leaf];
-                if (rec.w > 0.0) {
-                    diffuse_out = light_albedo[count] * rec.xyz;
+                let shared = sibling_light(leaf);
+                if (shared.w > 0.0) {
+                    diffuse_out = light_albedo[count] * shared.xyz;
                 }
             }
         }
