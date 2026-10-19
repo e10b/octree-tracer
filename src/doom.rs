@@ -29,6 +29,7 @@ pub struct LoadedMap {
     pub grid: i32,
     pub walk: bool,
     pub pictures: crate::play::Pictures,
+    pub frame: crate::wad::MapFrame,
 }
 
 /// Load E1M1 at one texel per voxel. A Doom WAD on disk supplies the map, the
@@ -42,6 +43,7 @@ pub fn load_e1m1() -> LoadedMap {
             map.grid,
             true,
             map.pictures,
+            map.frame,
         );
     }
 
@@ -70,6 +72,12 @@ pub fn load_e1m1() -> LoadedMap {
         grid,
         false,
         crate::play::Pictures::empty(),
+        crate::wad::MapFrame {
+            min_x: 0,
+            min_h: 0,
+            max_y: 0,
+            grid,
+        },
     )
 }
 
@@ -80,6 +88,7 @@ fn finish(
     grid: i32,
     walk: bool,
     pictures: crate::play::Pictures,
+    frame: crate::wad::MapFrame,
 ) -> LoadedMap {
     let bits = grid.trailing_zeros() as i32;
     println!("Doom E1M1: {} solid voxels", voxels.len());
@@ -108,6 +117,7 @@ fn finish(
         grid,
         walk,
         pictures,
+        frame,
     }
 }
 

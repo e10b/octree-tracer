@@ -20,6 +20,8 @@ pub struct App {
     use_held: bool,
     last_time: f64,
     play: Play,
+    room: Option<crate::room_play::RoomPlay>,
+    frame: crate::wad::MapFrame,
     ui: Ui,
 }
 
@@ -68,6 +70,12 @@ impl App {
         let mut render = Render::new(&gpu, window, &octree).await;
         let play = Play::new(map.pictures);
         render.set_atlas(&gpu, &play.pictures.atlas, play.pictures.atlas_size);
+        let frame = map.frame;
+        let room = if walk {
+            crate::wad::find_wad().map(|path| crate::room_play::RoomPlay::start(&path))
+        } else {
+            None
+        };
         let compute = Compute::new(&gpu, &render);
 
         let app = Self {
@@ -89,6 +97,8 @@ impl App {
             use_held: false,
             last_time: 0.0,
             play,
+            room,
+            frame,
             ui: Default::default(),
         };
 
@@ -102,11 +112,21 @@ impl App {
         let dt = dt.clamp(0.0, 0.05);
         self.last_time = time;
 
+        if let Some(room) = self.room.as_mut() {
+            room.sync(&self.input, self.character.cursour_grabbed);
+            room.tick();
+            if let Some((pos, look)) = room.view(&self.frame) {
+                self.character.pos = pos;
+                self.character.look = look;
+            }
+            self.input.mouse_delta = Vector2::zero();
+        }
+
         let forward: Vector3<f32> = self.character.look.normalize();
         let right = forward.cross(Vector3::unit_y()).normalize();
         let up = right.cross(forward);
 
-        if self.walk {
+        if self.walk && self.room.is_none() {
             let mut flat = Vector3::new(forward.x, 0.0, forward.z);
             if flat.magnitude2() < 1.0e-8 {
                 flat = Vector3::new(0.0, 0.0, 1.0);
@@ -149,7 +169,7 @@ impl App {
             }
             self.vy = stepped.1;
             self.on_ground = stepped.2;
-        } else {
+        } else if self.room.is_none() {
             let boost = if self.input.boost { 10.0 } else { 1.0 };
             let input = Vector3::new(
                 self.input.right as u32 as f32 - self.input.left as u32 as f32,
@@ -177,7 +197,7 @@ impl App {
             self.render.clear_all_voxel_light(&self.gpu);
         }
 
-        if self.character.cursour_grabbed {
+        if self.character.cursour_grabbed && self.room.is_none() {
             let delta = self.settings.sensitivity * self.input.mouse_delta * self.settings.fov;
             let rotation = Quaternion::from_axis_angle(right, Rad(-delta.y))
                 * Quaternion::from_axis_angle(Vector3::unit_y(), Rad(-delta.x));
@@ -204,7 +224,17 @@ impl App {
             terrain_origin,
         );
 
-        if self.walk {
+        if self.walk && self.room.is_some() {
+            let mesh = self.room.as_ref().and_then(|room| room.mesh(&self.frame));
+            if let Some(mesh) = mesh {
+                let eye = [
+                    self.character.pos.x,
+                    self.character.pos.y,
+                    self.character.pos.z,
+                ];
+                self.render.set_things(&self.gpu, &mesh, eye);
+            }
+        } else if self.walk {
             if self.character.cursour_grabbed && self.input.use_door && !self.use_held {
                 let pos = self.character.pos;
                 let look = self.character.look;
@@ -285,7 +315,7 @@ impl App {
             100.0 * (8.0 * self.octree.hole_stack.len() as f32) / self.octree.nodes.len() as f32;
 
         let ctx = self.render.egui_platform.context();
-        if self.walk {
+        if self.walk && self.room.is_none() {
             self.play.hud(&ctx, time);
         }
 

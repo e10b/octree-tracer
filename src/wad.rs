@@ -6,11 +6,20 @@ use super::*;
 use std::collections::HashMap;
 use std::sync::Arc;
 
+/// Corner of the voxel cube, in Doom map units, so room's actors land on the walls.
+pub struct MapFrame {
+    pub min_x: i32,
+    pub min_h: i32,
+    pub max_y: i32,
+    pub grid: i32,
+}
+
 pub struct BuiltMap {
     pub voxels: HashMap<u64, Voxel>,
     pub spawn: [i32; 3],
     pub look: [f32; 3],
     pub grid: i32,
+    pub frame: MapFrame,
     pub pictures: crate::play::Pictures,
 }
 
@@ -561,6 +570,7 @@ pub(crate) fn find_wad() -> Option<std::path::PathBuf> {
         cands.push(root.join("files").join(name));
         cands.push(root.join(name));
         cands.push(root.join("../CoolDoom").join(name));
+        cands.push(root.join("../room").join(name));
     }
     cands.push(std::path::PathBuf::from(
         "/Users/ethan/Code/CoolDoom/doom1.wad",
@@ -893,6 +903,12 @@ fn assemble(data: &[u8]) -> Result<BuiltMap, String> {
         spawn,
         look,
         grid,
+        frame: MapFrame {
+            min_x,
+            min_h,
+            max_y,
+            grid,
+        },
         pictures,
     })
 }

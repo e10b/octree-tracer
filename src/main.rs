@@ -8,6 +8,7 @@ use winit::{
 };
 
 mod adaptive;
+mod room_play;
 mod app;
 mod block_world;
 mod compute;
@@ -154,16 +155,16 @@ async fn main() {
 }
 
 pub struct Input {
-    forward: bool,
-    backward: bool,
-    right: bool,
-    left: bool,
-    up: bool,
-    down: bool,
-    boost: bool,
-    fire: bool,
-    use_door: bool,
-    mouse_delta: Vector2<f32>,
+    pub(crate) forward: bool,
+    pub(crate) backward: bool,
+    pub(crate) right: bool,
+    pub(crate) left: bool,
+    pub(crate) up: bool,
+    pub(crate) down: bool,
+    pub(crate) boost: bool,
+    pub(crate) fire: bool,
+    pub(crate) use_door: bool,
+    pub(crate) mouse_delta: Vector2<f32>,
 }
 
 impl Input {

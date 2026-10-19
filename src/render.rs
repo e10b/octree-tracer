@@ -74,6 +74,17 @@ pub struct Render {
     sprite_verts: wgpu::Buffer,
     sprite_count: u32,
     gun_count: u32,
+    thing_pipeline: wgpu::RenderPipeline,
+    thing_gun_pipeline: wgpu::RenderPipeline,
+    thing_layout: wgpu::BindGroupLayout,
+    thing_bind: wgpu::BindGroup,
+    thing_verts: wgpu::Buffer,
+    thing_indices: wgpu::Buffer,
+    thing_uniform: wgpu::Buffer,
+    thing_world: u32,
+    thing_gun: u32,
+    thing_vert_cap: u64,
+    thing_index_cap: u64,
     pub previous_frame_time: Option<f64>,
     pub egui_platform: egui_winit_platform::Platform,
     pub egui_rpass: egui_wgpu_backend::RenderPass,
@@ -402,6 +413,8 @@ impl Render {
             upscale_pass(&gpu.device, config.format, &scene_view);
         let (sprite_layout, sprite_pipeline, gun_pipeline, sprite_bind, sprite_verts) =
             sprite_pass(&gpu.device, SCENE_FORMAT);
+        let (thing_pipeline, thing_gun_pipeline, thing_layout, thing_bind, thing_verts, thing_indices, thing_uniform) =
+            thing_pass(&gpu.device, &gpu.queue, SCENE_FORMAT);
 
         // egui
         let size = window.inner_size();
@@ -485,6 +498,17 @@ impl Render {
             sprite_verts,
             sprite_count: 0,
             gun_count: 0,
+            thing_pipeline,
+            thing_gun_pipeline,
+            thing_layout,
+            thing_bind,
+            thing_verts,
+            thing_indices,
+            thing_uniform,
+            thing_world: 0,
+            thing_gun: 0,
+            thing_vert_cap: 1024 * 1024,
+            thing_index_cap: 1024 * 1024,
             previous_frame_time,
             egui_platform,
             egui_rpass,
@@ -648,6 +672,61 @@ impl Render {
         let gun_count = gun.len().min(all.len()) as u32;
         self.sprite_count = all.len() as u32 - gun_count;
         self.gun_count = gun_count;
+    }
+
+    pub fn set_things(
+        &mut self,
+        gpu: &Gpu,
+        mesh: &crate::room_play::ThingMesh,
+        eye: [f32; 3],
+    ) {
+        if let Some((size, rgba)) = mesh.atlas.as_ref() {
+            self.thing_bind = upload_thing_atlas(
+                &gpu.device,
+                &gpu.queue,
+                &self.thing_layout,
+                &self.thing_uniform,
+                *size,
+                rgba,
+            );
+        }
+        let uniforms = ThingUniforms {
+            camera: self.uniforms.camera,
+            eye: [eye[0], eye[1], eye[2], 1.0],
+        };
+        gpu.queue
+            .write_buffer(&self.thing_uniform, 0, bytemuck::bytes_of(&uniforms));
+        let vert_bytes = bytemuck::cast_slice(&mesh.verts);
+        if self.thing_vert_cap < vert_bytes.len() as u64 {
+            self.thing_vert_cap = (vert_bytes.len() as u64).next_power_of_two().max(4);
+            self.thing_verts = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("thing verts"),
+                size: self.thing_vert_cap,
+                usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if !vert_bytes.is_empty() {
+            gpu.queue.write_buffer(&self.thing_verts, 0, vert_bytes);
+        }
+        let mut indices = Vec::with_capacity(mesh.world_indices.len() + mesh.gun_indices.len());
+        indices.extend_from_slice(&mesh.world_indices);
+        indices.extend_from_slice(&mesh.gun_indices);
+        let index_bytes = bytemuck::cast_slice(&indices);
+        if self.thing_index_cap < index_bytes.len() as u64 {
+            self.thing_index_cap = (index_bytes.len() as u64).next_power_of_two().max(4);
+            self.thing_indices = gpu.device.create_buffer(&wgpu::BufferDescriptor {
+                label: Some("thing indices"),
+                size: self.thing_index_cap,
+                usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+                mapped_at_creation: false,
+            });
+        }
+        if !index_bytes.is_empty() {
+            gpu.queue.write_buffer(&self.thing_indices, 0, index_bytes);
+        }
+        self.thing_world = mesh.world_indices.len() as u32;
+        self.thing_gun = mesh.gun_indices.len() as u32;
     }
 
     pub fn update(
@@ -1004,7 +1083,7 @@ impl Render {
             self.oidn_history_valid = false;
         }
 
-        if self.sprite_count > 0 || self.gun_count > 0 {
+        if self.sprite_count > 0 || self.gun_count > 0 || self.thing_world > 0 || self.thing_gun > 0 {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
                 label: Some("sprite pass"),
                 color_attachments: &[wgpu::RenderPassColorAttachment {
@@ -1033,6 +1112,23 @@ impl Render {
             render_pass.set_pipeline(&self.gun_pipeline);
             if self.gun_count > 0 {
                 render_pass.draw(self.sprite_count..self.sprite_count + self.gun_count, 0..1);
+            }
+            if self.thing_world > 0 || self.thing_gun > 0 {
+                render_pass.set_bind_group(0, &self.thing_bind, &[]);
+                render_pass.set_vertex_buffer(0, self.thing_verts.slice(..));
+                render_pass.set_index_buffer(self.thing_indices.slice(..), wgpu::IndexFormat::Uint32);
+                render_pass.set_pipeline(&self.thing_pipeline);
+                if self.thing_world > 0 {
+                    render_pass.draw_indexed(0..self.thing_world, 0, 0..1);
+                }
+                render_pass.set_pipeline(&self.thing_gun_pipeline);
+                if self.thing_gun > 0 {
+                    render_pass.draw_indexed(
+                        self.thing_world..self.thing_world + self.thing_gun,
+                        0,
+                        0..1,
+                    );
+                }
             }
         }
 
@@ -2216,6 +2312,245 @@ fn sprite_pass(
         mapped_at_creation: false,
     });
     (layout, sprite_pipeline, gun_pipeline, bind, verts)
+}
+
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct ThingUniforms {
+    camera: [[f32; 4]; 4],
+    eye: [f32; 4],
+}
+
+fn thing_pass(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    format: wgpu::TextureFormat,
+) -> (
+    wgpu::RenderPipeline,
+    wgpu::RenderPipeline,
+    wgpu::BindGroupLayout,
+    wgpu::BindGroup,
+    wgpu::Buffer,
+    wgpu::Buffer,
+    wgpu::Buffer,
+) {
+    let shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        label: Some("thing shader"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("things.wgsl").into()),
+    });
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("thing layout"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::VERTEX | wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: true },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Sampler(wgpu::SamplerBindingType::Filtering),
+                count: None,
+            },
+        ],
+    });
+    let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("thing camera"),
+        size: std::mem::size_of::<ThingUniforms>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let tex = thing_texture(device, 1);
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &tex.0,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        &[255, 255, 255, 255],
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: std::num::NonZeroU32::new(4),
+            rows_per_image: std::num::NonZeroU32::new(1),
+        },
+        wgpu::Extent3d {
+            width: 1,
+            height: 1,
+            depth_or_array_layers: 1,
+        },
+    );
+    let bind = thing_bind(device, &layout, &uniform, &tex);
+    let pipeline_layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+        label: Some("thing pipeline layout"),
+        bind_group_layouts: &[&layout],
+        push_constant_ranges: &[],
+    });
+    let buffers = [wgpu::VertexBufferLayout {
+        array_stride: std::mem::size_of::<crate::room_play::ThingVert>() as u64,
+        step_mode: wgpu::VertexStepMode::Vertex,
+        attributes: &THING_ATTRS,
+    }];
+    let make = |write: bool, compare: wgpu::CompareFunction, label: &str| {
+        device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+            label: Some(label),
+            layout: Some(&pipeline_layout),
+            vertex: wgpu::VertexState {
+                module: &shader,
+                entry_point: "vs_main",
+                buffers: &buffers,
+            },
+            fragment: Some(wgpu::FragmentState {
+                module: &shader,
+                entry_point: "fs_main",
+                targets: &[wgpu::ColorTargetState {
+                    format,
+                    blend: Some(wgpu::BlendState::REPLACE),
+                    write_mask: wgpu::ColorWrites::ALL,
+                }],
+            }),
+            primitive: wgpu::PrimitiveState {
+                topology: wgpu::PrimitiveTopology::TriangleList,
+                strip_index_format: None,
+                front_face: wgpu::FrontFace::Ccw,
+                cull_mode: None,
+                polygon_mode: wgpu::PolygonMode::Fill,
+                unclipped_depth: false,
+                conservative: false,
+            },
+            depth_stencil: Some(depth_state(write, compare)),
+            multisample: wgpu::MultisampleState {
+                count: 1,
+                mask: !0,
+                alpha_to_coverage_enabled: false,
+            },
+            multiview: None,
+        })
+    };
+    let thing_pipeline = make(true, wgpu::CompareFunction::Less, "thing pipeline");
+    let gun_pipeline = make(false, wgpu::CompareFunction::Always, "thing gun pipeline");
+    let verts = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("thing verts"),
+        size: 1024 * 1024,
+        usage: wgpu::BufferUsages::VERTEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let indices = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("thing indices"),
+        size: 1024 * 1024,
+        usage: wgpu::BufferUsages::INDEX | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    (thing_pipeline, gun_pipeline, layout, bind, verts, indices, uniform)
+}
+
+const THING_ATTRS: [wgpu::VertexAttribute; 5] = wgpu::vertex_attr_array![
+    0 => Float32x3,
+    1 => Float32x2,
+    2 => Float32x4,
+    3 => Float32x3,
+    4 => Float32,
+];
+
+fn thing_texture(device: &wgpu::Device, size: u32) -> (wgpu::Texture, wgpu::TextureView, wgpu::Sampler) {
+    let size = size.max(1);
+    let texture = device.create_texture(&wgpu::TextureDescriptor {
+        label: Some("thing atlas"),
+        size: wgpu::Extent3d {
+            width: size,
+            height: size,
+            depth_or_array_layers: 1,
+        },
+        mip_level_count: 1,
+        sample_count: 1,
+        dimension: wgpu::TextureDimension::D2,
+        format: wgpu::TextureFormat::Rgba8Unorm,
+        usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
+    });
+    let view = texture.create_view(&wgpu::TextureViewDescriptor::default());
+    let sampler = device.create_sampler(&wgpu::SamplerDescriptor {
+        label: Some("thing sampler"),
+        address_mode_u: wgpu::AddressMode::ClampToEdge,
+        address_mode_v: wgpu::AddressMode::ClampToEdge,
+        address_mode_w: wgpu::AddressMode::ClampToEdge,
+        mag_filter: wgpu::FilterMode::Nearest,
+        min_filter: wgpu::FilterMode::Nearest,
+        mipmap_filter: wgpu::FilterMode::Nearest,
+        ..Default::default()
+    });
+    (texture, view, sampler)
+}
+
+fn thing_bind(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    uniform: &wgpu::Buffer,
+    tex: &(wgpu::Texture, wgpu::TextureView, wgpu::Sampler),
+) -> wgpu::BindGroup {
+    device.create_bind_group(&wgpu::BindGroupDescriptor {
+        label: Some("thing bind"),
+        layout,
+        entries: &[
+            wgpu::BindGroupEntry {
+                binding: 0,
+                resource: uniform.as_entire_binding(),
+            },
+            wgpu::BindGroupEntry {
+                binding: 1,
+                resource: wgpu::BindingResource::TextureView(&tex.1),
+            },
+            wgpu::BindGroupEntry {
+                binding: 2,
+                resource: wgpu::BindingResource::Sampler(&tex.2),
+            },
+        ],
+    })
+}
+
+fn upload_thing_atlas(
+    device: &wgpu::Device,
+    queue: &wgpu::Queue,
+    layout: &wgpu::BindGroupLayout,
+    uniform: &wgpu::Buffer,
+    size: u32,
+    rgba: &[u8],
+) -> wgpu::BindGroup {
+    let tex = thing_texture(device, size);
+    queue.write_texture(
+        wgpu::ImageCopyTexture {
+            texture: &tex.0,
+            mip_level: 0,
+            origin: wgpu::Origin3d::ZERO,
+            aspect: wgpu::TextureAspect::All,
+        },
+        rgba,
+        wgpu::ImageDataLayout {
+            offset: 0,
+            bytes_per_row: std::num::NonZeroU32::new(size.max(1) * 4),
+            rows_per_image: std::num::NonZeroU32::new(size.max(1)),
+        },
+        wgpu::Extent3d {
+            width: size.max(1),
+            height: size.max(1),
+            depth_or_array_layers: 1,
+        },
+    );
+    thing_bind(device, layout, uniform, &tex)
 }
 
 #[repr(C)]

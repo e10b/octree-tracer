@@ -27,6 +27,7 @@ image = { version = "0.24.9", default-features = false, features = ["png"] }
 json = "0.12.4"
 half = "2"
 oidn = "2.5"
+room = { path = "../room/room", default-features = false }
 
 [profile.release]
 debug = 1
