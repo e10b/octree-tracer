@@ -64,6 +64,16 @@ pub struct Render {
     scene_tex: wgpu::Texture,
     scene_view: wgpu::TextureView,
     depth_view: wgpu::TextureView,
+    taa_tex: [wgpu::Texture; 2],
+    taa_view: [wgpu::TextureView; 2],
+    taa_layout: wgpu::BindGroupLayout,
+    // The 2×2 ray grid replaced this resolve. Kept so the pass can come back.
+    #[allow(dead_code)]
+    taa_pipeline: wgpu::RenderPipeline,
+    taa_binds: [wgpu::BindGroup; 2],
+    taa_uniform: wgpu::Buffer,
+    taa_index: usize,
+    taa_ready: bool,
     upscale_layout: wgpu::BindGroupLayout,
     upscale_pipeline: wgpu::RenderPipeline,
     upscale_bind: wgpu::BindGroup,
@@ -409,8 +419,15 @@ impl Render {
             &oidn_blend_buffer,
         );
         let depth_view = depth_texture(&gpu.device, render_size.width, render_size.height);
+        let (taa_layout, taa_pipeline, taa_uniform, taa_tex, taa_view, taa_binds) = taa_pass(
+            &gpu.device,
+            &scene_view,
+            &depth_view,
+            render_size.width,
+            render_size.height,
+        );
         let (upscale_layout, upscale_pipeline, upscale_bind) =
-            upscale_pass(&gpu.device, config.format, &scene_view);
+            upscale_pass(&gpu.device, config.format, &taa_view[0]);
         let (sprite_layout, sprite_pipeline, gun_pipeline, sprite_bind, sprite_verts) =
             sprite_pass(&gpu.device, SCENE_FORMAT);
         let (thing_pipeline, thing_gun_pipeline, thing_layout, thing_bind, thing_verts, thing_indices, thing_uniform) =
@@ -488,6 +505,14 @@ impl Render {
             scene_tex,
             scene_view,
             depth_view,
+            taa_tex,
+            taa_view,
+            taa_layout,
+            taa_pipeline,
+            taa_binds,
+            taa_uniform,
+            taa_index: 0,
+            taa_ready: false,
             upscale_layout,
             upscale_pipeline,
             upscale_bind,
@@ -532,6 +557,20 @@ impl Render {
             self.scene_view = scene_view;
             self.depth_view =
                 depth_texture(&gpu.device, self.render_size.width, self.render_size.height);
+            let (taa_tex, taa_view, taa_binds) = taa_targets(
+                &gpu.device,
+                &self.taa_layout,
+                &self.taa_uniform,
+                &self.scene_view,
+                &self.depth_view,
+                self.render_size.width,
+                self.render_size.height,
+            );
+            self.taa_tex = taa_tex;
+            self.taa_view = taa_view;
+            self.taa_binds = taa_binds;
+            self.taa_index = 0;
+            self.taa_ready = false;
             self.history_buffers = [
                 history_buffer(&gpu.device, self.render_size.width, self.render_size.height),
                 history_buffer(&gpu.device, self.render_size.width, self.render_size.height),
@@ -598,7 +637,7 @@ impl Render {
             self.upscale_bind = upscale_bind_group(
                 &gpu.device,
                 &self.upscale_layout,
-                &self.scene_view,
+                &self.taa_view[0],
             );
             self.path_uniforms.frame_index = 0;
             self.last_path_signature = None;
@@ -693,6 +732,12 @@ impl Render {
         let uniforms = ThingUniforms {
             camera: self.uniforms.camera,
             eye: [eye[0], eye[1], eye[2], 1.0],
+            frame_index: self.path_uniforms.frame_index,
+            _pad: 0,
+            resolution: [
+                self.render_size.width as f32,
+                self.render_size.height as f32,
+            ],
         };
         gpu.queue
             .write_buffer(&self.thing_uniform, 0, bytemuck::bytes_of(&uniforms));
@@ -1132,6 +1177,13 @@ impl Render {
             }
         }
 
+        // The traced pixel is already a 2×2 average. Present that frame directly.
+        self.upscale_bind = upscale_bind_group(
+            &gpu.device,
+            &self.upscale_layout,
+            &self.scene_view,
+        );
+
         // Upscale only the game image. Egui is drawn afterwards at native resolution.
         {
             let mut render_pass = encoder.begin_render_pass(&wgpu::RenderPassDescriptor {
@@ -1334,6 +1386,168 @@ fn scene_texture(
     (texture, view)
 }
 
+#[repr(C)]
+#[derive(Copy, Clone, bytemuck::Pod, bytemuck::Zeroable)]
+struct TaaUniforms {
+    camera_inverse: [[f32; 4]; 4],
+    previous_camera: [[f32; 4]; 4],
+    dimensions: [f32; 2],
+    history_valid: u32,
+    frame_index: u32,
+}
+
+fn taa_pass(
+    device: &wgpu::Device,
+    scene: &wgpu::TextureView,
+    depth: &wgpu::TextureView,
+    width: u32,
+    height: u32,
+) -> (
+    wgpu::BindGroupLayout,
+    wgpu::RenderPipeline,
+    wgpu::Buffer,
+    [wgpu::Texture; 2],
+    [wgpu::TextureView; 2],
+    [wgpu::BindGroup; 2],
+) {
+    let shader = device.create_shader_module(&wgpu::ShaderModuleDescriptor {
+        label: Some("TAA resolve"),
+        source: wgpu::ShaderSource::Wgsl(include_str!("taa.wgsl").into()),
+    });
+    let layout = device.create_bind_group_layout(&wgpu::BindGroupLayoutDescriptor {
+        label: Some("TAA resolve"),
+        entries: &[
+            wgpu::BindGroupLayoutEntry {
+                binding: 0,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 1,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Depth,
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 2,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Texture {
+                    sample_type: wgpu::TextureSampleType::Float { filterable: false },
+                    view_dimension: wgpu::TextureViewDimension::D2,
+                    multisampled: false,
+                },
+                count: None,
+            },
+            wgpu::BindGroupLayoutEntry {
+                binding: 3,
+                visibility: wgpu::ShaderStages::FRAGMENT,
+                ty: wgpu::BindingType::Buffer {
+                    ty: wgpu::BufferBindingType::Uniform,
+                    has_dynamic_offset: false,
+                    min_binding_size: None,
+                },
+                count: None,
+            },
+        ],
+    });
+    let pipeline = device.create_render_pipeline(&wgpu::RenderPipelineDescriptor {
+        label: Some("TAA resolve"),
+        layout: Some(&device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
+            label: Some("TAA resolve"),
+            bind_group_layouts: &[&layout],
+            push_constant_ranges: &[],
+        })),
+        vertex: wgpu::VertexState {
+            module: &shader,
+            entry_point: "vs_main",
+            buffers: &[],
+        },
+        fragment: Some(wgpu::FragmentState {
+            module: &shader,
+            entry_point: "fs_main",
+            targets: &[wgpu::ColorTargetState {
+                format: SCENE_FORMAT,
+                blend: None,
+                write_mask: wgpu::ColorWrites::ALL,
+            }],
+        }),
+        primitive: wgpu::PrimitiveState {
+            topology: wgpu::PrimitiveTopology::TriangleStrip,
+            strip_index_format: None,
+            front_face: wgpu::FrontFace::Ccw,
+            cull_mode: None,
+            polygon_mode: wgpu::PolygonMode::Fill,
+            unclipped_depth: false,
+            conservative: false,
+        },
+        depth_stencil: None,
+        multisample: wgpu::MultisampleState {
+            count: 1,
+            mask: !0,
+            alpha_to_coverage_enabled: false,
+        },
+        multiview: None,
+    });
+    let uniform = device.create_buffer(&wgpu::BufferDescriptor {
+        label: Some("TAA uniforms"),
+        size: std::mem::size_of::<TaaUniforms>() as u64,
+        usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
+        mapped_at_creation: false,
+    });
+    let (textures, views, binds) = taa_targets(device, &layout, &uniform, scene, depth, width, height);
+    (layout, pipeline, uniform, textures, views, binds)
+}
+
+fn taa_targets(
+    device: &wgpu::Device,
+    layout: &wgpu::BindGroupLayout,
+    uniform: &wgpu::Buffer,
+    scene: &wgpu::TextureView,
+    depth: &wgpu::TextureView,
+    width: u32,
+    height: u32,
+) -> ([wgpu::Texture; 2], [wgpu::TextureView; 2], [wgpu::BindGroup; 2]) {
+    let (tex0, view0) = scene_texture(device, SCENE_FORMAT, width, height);
+    let (tex1, view1) = scene_texture(device, SCENE_FORMAT, width, height);
+    let views = [view0, view1];
+    let bind = |history: &wgpu::TextureView| {
+        device.create_bind_group(&wgpu::BindGroupDescriptor {
+            label: Some("TAA resolve"),
+            layout,
+            entries: &[
+                wgpu::BindGroupEntry {
+                    binding: 0,
+                    resource: wgpu::BindingResource::TextureView(scene),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 1,
+                    resource: wgpu::BindingResource::TextureView(depth),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 2,
+                    resource: wgpu::BindingResource::TextureView(history),
+                },
+                wgpu::BindGroupEntry {
+                    binding: 3,
+                    resource: uniform.as_entire_binding(),
+                },
+            ],
+        })
+    };
+    // binds[i] writes views[i] and reads the other view as history.
+    let binds = [bind(&views[1]), bind(&views[0])];
+    ([tex0, tex1], views, binds)
+}
+
 fn upscale_pass(
     device: &wgpu::Device,
     format: wgpu::TextureFormat,
@@ -1450,7 +1664,7 @@ fn depth_texture(device: &wgpu::Device, width: u32, height: u32) -> wgpu::Textur
         sample_count: 1,
         dimension: wgpu::TextureDimension::D2,
         format: wgpu::TextureFormat::Depth32Float,
-        usage: wgpu::TextureUsages::RENDER_ATTACHMENT,
+        usage: wgpu::TextureUsages::RENDER_ATTACHMENT | wgpu::TextureUsages::TEXTURE_BINDING,
     });
     texture.create_view(&wgpu::TextureViewDescriptor::default())
 }
@@ -2319,6 +2533,9 @@ fn sprite_pass(
 struct ThingUniforms {
     camera: [[f32; 4]; 4],
     eye: [f32; 4],
+    frame_index: u32,
+    _pad: u32,
+    resolution: [f32; 2],
 }
 
 fn thing_pass(
@@ -2443,7 +2660,7 @@ fn thing_pass(
         })
     };
     let thing_pipeline = make(true, wgpu::CompareFunction::Less, "thing pipeline");
-    let gun_pipeline = make(false, wgpu::CompareFunction::Always, "thing gun pipeline");
+    let gun_pipeline = make(true, wgpu::CompareFunction::Always, "thing gun pipeline");
     let verts = device.create_buffer(&wgpu::BufferDescriptor {
         label: Some("thing verts"),
         size: 1024 * 1024,

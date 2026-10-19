@@ -121,6 +121,12 @@ fn get_clip_space(frag_pos: vec4<f32>, dimensions: vec2<f32>) -> vec2<f32> {
     return clip_space;
 }
 
+fn primary_dir(pos: vec3<f32>, frag: vec4<f32>, offset: vec2<f32>) -> vec3<f32> {
+    let clip = get_clip_space(frag + vec4<f32>(offset, 0.0, 0.0), u.dimensions.xy);
+    let dir_h = u.camera_inverse * vec4<f32>(clip.x, clip.y, 1.0, 1.0);
+    return normalize(dir_h.xyz / dir_h.w - pos);
+}
+
 struct Ray {
     pos: vec3<f32>;
     dir: vec3<f32>;
@@ -1005,19 +1011,11 @@ fn fs_main(in: FSIn) -> FSOut {
     let pixel_index = pixel.y * u32(u.dimensions.x) + pixel.x;
     let noise_coord = vec2<i32>(i32(pixel.x % 64u), i32(pixel.y % 64u));
     let blue = textureLoad(blue_noise, noise_coord, 0).rg;
-    let frame_shift = vec2<f32>(
-        random_float(hash_u32(path.frame_index * 0x9e3779b9u)),
-        random_float(hash_u32(path.frame_index * 0x68bc21ebu + 1u)),
-    );
-    let jitter = fract(blue + frame_shift) - vec2<f32>(0.5);
     let blue_seed = u32(blue.x * 255.0) | (u32(blue.y * 255.0) << 8u);
     let seed = hash_u32(pixel.x + pixel.y * 65537u + path.frame_index * 0x9e3779b9u ^ blue_seed);
-    let clip_space = get_clip_space(in.frag_pos + vec4<f32>(jitter, 0.0, 0.0), u.dimensions.xy);
 
-    let pos = u.camera_inverse * vec4<f32>(0.0, 0.0, 0.0, 1.0);
-    let dir = u.camera_inverse * vec4<f32>(clip_space.x, clip_space.y, 1.0, 1.0);
-    let pos = pos.xyz / pos.w;
-    let dir = normalize(dir.xyz / dir.w - pos);
+    let pos_h = u.camera_inverse * vec4<f32>(0.0, 0.0, 0.0, 1.0);
+    let pos = pos_h.xyz / pos_h.w;
     // 0 is a 2×2 lighting grid inside the pixel. 2 and 3 keep one pixel per cell.
     let scale = path.light_scale;
     var gather = true;
@@ -1026,15 +1024,16 @@ fn fs_main(in: FSIn) -> FSOut {
         let phase = path.frame_index % cell;
         gather = (pixel.x % scale) == (phase % scale) && (pixel.y % scale) == (phase / scale);
     }
-    let fine = path.voxel_light != 0u && scale == 0u && !u.show_steps && !u.show_hits;
-    var ray_dir = dir;
-    if (fine) {
-        let sub_clip = get_clip_space(in.frag_pos + vec4<f32>(jitter.x - 0.25, jitter.y - 0.25, 0.0, 0.0), u.dimensions.xy);
-        let sub_dir_h = u.camera_inverse * vec4<f32>(sub_clip.x, sub_clip.y, 1.0, 1.0);
-        ray_dir = normalize(sub_dir_h.xyz / sub_dir_h.w - pos);
+    let debug_view = u.show_steps || u.show_hits;
+    // Four fixed taps cover the pixel. A moving camera keeps this frame only,
+    // so the grid does not slide and the edge does not smear.
+    var origin = vec2<f32>(-0.25, -0.25);
+    if (debug_view) {
+        origin = vec2<f32>(0.0, 0.0);
     }
-    var sample = trace_path(pos, ray_dir, seed, gather, pixel);
-    if (fine) {
+    let fine = path.voxel_light != 0u && scale == 0u && !debug_view;
+    var sample = trace_path(pos, primary_dir(pos, in.frag_pos, origin), seed, gather, pixel);
+    if (!debug_view) {
         var sum = sample.radiance;
         var s = 1u;
         loop {
@@ -1043,11 +1042,18 @@ fn fs_main(in: FSIn) -> FSOut {
             if ((s & 1u) == 1u) { ox = 0.25; }
             var oy = -0.25;
             if (s >= 2u) { oy = 0.25; }
-            let sub_clip = get_clip_space(in.frag_pos + vec4<f32>(jitter.x + ox, jitter.y + oy, 0.0, 0.0), u.dimensions.xy);
-            let sub_dir_h = u.camera_inverse * vec4<f32>(sub_clip.x, sub_clip.y, 1.0, 1.0);
-            let sub_dir = normalize(sub_dir_h.xyz / sub_dir_h.w - pos);
             let sub_seed = hash_u32(seed ^ (s * 0x85ebca6bu));
-            sum = sum + trace_path(pos, sub_dir, sub_seed, true, pixel).radiance;
+            let sub = trace_path(pos, primary_dir(pos, in.frag_pos, vec2<f32>(ox, oy)), sub_seed, fine, pixel);
+            sum = sum + sub.radiance;
+            if (sub.first_hit && (!sample.first_hit || sub.depth < sample.depth)) {
+                sample.depth = sub.depth;
+                sample.steps = sub.steps;
+                sample.first_albedo = sub.first_albedo;
+                sample.first_hit = true;
+                sample.first_hit_count = sub.first_hit_count;
+                sample.first_pos = sub.first_pos;
+                sample.first_normal = sub.first_normal;
+            }
             s = s + 1u;
         }
         sample.radiance = sum * 0.25;
@@ -1075,8 +1081,8 @@ fn fs_main(in: FSIn) -> FSOut {
     var history_length = 1.0;
 
     if (path.accumulate != 0u) {
-        // The camera has not moved, so this pixel's earlier samples are the same
-        // ray. Average them all. Temporal reprojection is only for when it moves.
+        // The camera has not moved, so these four rays land in the same places.
+        // Keep averaging frames. A moving camera shows this frame on its own.
         let count = max(f32(path.still_frames), 1.0);
         let alpha = 1.0 / count;
         let previous = history_in.data[pixel_index];

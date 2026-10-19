@@ -9,6 +9,9 @@ struct ThingVert {
 struct Uniforms {
     camera: mat4x4<f32>;
     eye: vec4<f32>;
+    frame_index: u32;
+    pad: u32;
+    resolution: vec2<f32>;
 };
 
 [[group(0), binding(0)]]
