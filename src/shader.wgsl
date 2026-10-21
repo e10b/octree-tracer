@@ -44,7 +44,7 @@ struct PathUniforms {
     history_valid: u32;
     accumulate: u32;
     still_frames: u32;
-    // 1: replace diffuse lighting with the voxel's running mean.
+    // 1: shade the sun at the hit and cache indirect irradiance only.
     voxel_light: u32;
     light_scale: u32;
     light_samples: u32;
@@ -67,9 +67,13 @@ var<uniform> path: PathUniforms;
 var<storage, read_write> history_out: History;
 [[group(0), binding(5)]]
 var blue_noise: texture_2d<f32>;
-// One record per node: rgb is the float irradiance mean, w is the sample count.
+// Four words per node. rgb are the summed indirect irradiance in fixed point
+// (2048 units per 1.0). w packs the sample count in bits 0-6, a sun
+// visibility in bits 7-8, and a frame tag above that. The sun shading of
+// the pixel is not part of the sum. Plain stores, not atomics: this
+// wgpu/Metal version cannot address a bounds-checked atomic array element.
 struct VoxelLight {
-    data: [[stride(16)]] array<vec4<f32>>;
+    data: [[stride(4)]] array<u32>;
 };
 [[group(0), binding(6)]]
 var<storage, read_write> voxel_light: VoxelLight;
@@ -82,6 +86,18 @@ var<private> light_albedo: array<vec3<f32>, 6>;
 var<private> light_spec: array<vec3<f32>, 6>;
 var<private> light_indirect: array<f32, 6>;
 var<private> light_added: array<vec3<f32>, 6>;
+var<private> light_probed: array<u32, 6>;
+
+let LIGHT_QUANT = 2048.0;
+let LIGHT_CAP = 64u;
+let LIGHT_PRIOR = 4u;
+// w: count in 0-6, sun-valid in 7, sun-lit in 8, frame tag in 9-31.
+// The tag is never 0, so a cleared word is not "already done this frame".
+let COUNT_MASK = 127u;
+let SUN_VALID = 128u;
+let SUN_LIT = 256u;
+let SUN_MASK = 384u;
+let FRAME_SHIFT = 9u;
 
 
 let VOXEL_OFFSET = 134217728u;
@@ -583,13 +599,24 @@ fn blue_disk(pixel: vec2<u32>, index: u32, slot: u32) -> vec2<f32> {
     return textureLoad(blue_noise, vec2<i32>(x, y), 0).rg;
 }
 
-fn cosine_from_blue(normal: vec3<f32>, sample_index: u32, sample_count: u32, rg: vec2<f32>) -> vec3<f32> {
-    let width = f32(max(sample_count, 1u));
-    let r2 = (f32(sample_index) + rg.x) / width;
-    let phi = 6.28318530718 * rg.y;
-    let radius = sqrt(r2);
-    let local = vec3<f32>(cos(phi) * radius, sqrt(max(0.0, 1.0 - r2)), sin(phi) * radius);
+// R2 fills the disk evenly from the first sample. The leaf's stored count is
+// the sequence index, so the next deposit lands in the gap the last one left.
+// Blue noise is only a toroidal rotation, which keeps neighbours from sharing
+// one pattern.
+fn r2_point(i: u32) -> vec2<f32> {
+    let p = f32(i) + 0.5;
+    return fract(vec2<f32>(p * 0.7548776662, p * 0.5698402909));
+}
+
+fn cosine_from_uv(normal: vec3<f32>, uv: vec2<f32>) -> vec3<f32> {
+    let radius = sqrt(uv.x);
+    let phi = 6.28318530718 * uv.y;
+    let local = vec3<f32>(cos(phi) * radius, sqrt(max(0.0, 1.0 - uv.x)), sin(phi) * radius);
     return to_world(normal, local);
+}
+
+fn disk_sample(normal: vec3<f32>, seq: u32, rot: vec2<f32>) -> vec3<f32> {
+    return cosine_from_uv(normal, fract(r2_point(seq) + rot));
 }
 
 fn sample_ggx(normal: vec3<f32>, roughness: f32, seed: u32) -> vec3<f32> {
@@ -625,9 +652,82 @@ fn luminance(colour: vec3<f32>) -> f32 {
     return dot(colour, vec3<f32>(0.2126, 0.7152, 0.0722));
 }
 
-// The eight children of one parent sit on an 8-aligned index. A leaf borrows
-// their light, weighted by how many samples each one holds. Its own record
-// still stores only its own samples.
+fn pack_rad(value: f32) -> u32 {
+    let q = i32(clamp(value, -64.0, 4096.0) * LIGHT_QUANT);
+    return bitcast<u32>(q);
+}
+
+fn unpack_rad(value: u32) -> f32 {
+    return f32(bitcast<i32>(value)) / LIGHT_QUANT;
+}
+
+fn frame_tag() -> u32 {
+    return (path.frame_index % 8388607u) + 1u;
+}
+
+fn light_meta(leaf: u32) -> u32 {
+    return voxel_light.data[leaf * 4u + 3u];
+}
+
+fn light_count(leaf: u32) -> u32 {
+    return light_meta(leaf) & COUNT_MASK;
+}
+
+fn seen_this_frame(leaf: u32) -> bool {
+    return (light_meta(leaf) >> FRAME_SHIFT) == frame_tag();
+}
+
+fn touch_frame(leaf: u32) {
+    let old = light_meta(leaf);
+    voxel_light.data[leaf * 4u + 3u] = (old & (COUNT_MASK | SUN_MASK)) | (frame_tag() << FRAME_SHIFT);
+}
+
+fn store_count(leaf: u32, count: u32) {
+    let old = light_meta(leaf);
+    var n = count;
+    if (n > COUNT_MASK) {
+        n = COUNT_MASK;
+    }
+    voxel_light.data[leaf * 4u + 3u] = n | (old & SUN_MASK) | (frame_tag() << FRAME_SHIFT);
+}
+
+// First ray that finds the sun on a leaf records it. Later probes read the
+// bit instead of tracing another shadow ray. The pixel's own sun ray is
+// unchanged, so the shadow on screen stays sharp.
+fn note_sun(leaf: u32, lit: bool) {
+    let old = light_meta(leaf);
+    if ((old & SUN_VALID) != 0u) {
+        return;
+    }
+    var bits = SUN_VALID;
+    if (lit) {
+        bits = bits | SUN_LIT;
+    }
+    voxel_light.data[leaf * 4u + 3u] = old | bits;
+}
+
+fn load_light(leaf: u32) -> vec4<f32> {
+    let count = light_count(leaf);
+    if (count == 0u) {
+        return vec4<f32>(0.0);
+    }
+    let inv = 1.0 / f32(count);
+    return vec4<f32>(
+        unpack_rad(voxel_light.data[leaf * 4u]) * inv,
+        unpack_rad(voxel_light.data[leaf * 4u + 1u]) * inv,
+        unpack_rad(voxel_light.data[leaf * 4u + 2u]) * inv,
+        f32(count),
+    );
+}
+
+fn add_rad(leaf: u32, value: vec3<f32>) {
+    voxel_light.data[leaf * 4u] = pack_rad(unpack_rad(voxel_light.data[leaf * 4u]) + value.x);
+    voxel_light.data[leaf * 4u + 1u] = pack_rad(unpack_rad(voxel_light.data[leaf * 4u + 1u]) + value.y);
+    voxel_light.data[leaf * 4u + 2u] = pack_rad(unpack_rad(voxel_light.data[leaf * 4u + 2u]) + value.z);
+}
+
+// The eight children of one parent sit on an 8-aligned index. A leaf with no
+// samples of its own borrows their indirect, weighted by sample count.
 fn sibling_light(leaf: u32) -> vec4<f32> {
     let base = leaf & 0xfffffff8u;
     var acc = vec3<f32>(0.0);
@@ -636,7 +736,7 @@ fn sibling_light(leaf: u32) -> vec4<f32> {
     loop {
         if (i >= 8u) { break; }
         let index = base + i;
-        let rec = voxel_light.data[index];
+        let rec = load_light(index);
         if (rec.w > 0.0 && node(index) >= VOXEL_OFFSET) {
             acc = acc + rec.xyz * rec.w;
             weight = weight + rec.w;
@@ -646,48 +746,76 @@ fn sibling_light(leaf: u32) -> vec4<f32> {
     if (weight <= 0.0) {
         return vec4<f32>(0.0);
     }
-    return vec4<f32>(acc / weight, 1.0);
+    return vec4<f32>(acc / weight, weight);
 }
 
-// Stores this diffuse sample on the leaf. The pixel shows the mean from
-// before this sample, so one noisy path does not repaint a settled voxel.
-// The count stops growing at 64 and then each new ray replaces 1/64 of the
-// mean, so walking into a new room keeps updating instead of freezing.
-fn deposit_light(leaf: u32, sample_l: vec3<f32>) -> vec3<f32> {
+// An empty leaf starts from its siblings at weight 4, so the first frame is
+// the neighbourhood indirect and later rays refine that instead of a raw
+// sample.
+fn seed_prior(leaf: u32) {
+    if (light_count(leaf) != 0u) {
+        return;
+    }
+    let shared = sibling_light(leaf);
+    if (shared.w <= 0.0) {
+        return;
+    }
+    let old = light_meta(leaf);
+    voxel_light.data[leaf * 4u + 3u] = LIGHT_PRIOR | (old & SUN_MASK) | ((old >> FRAME_SHIFT) << FRAME_SHIFT);
+    add_rad(leaf, shared.xyz * f32(LIGHT_PRIOR));
+}
+
+// Stores an average of `weight` rays and returns the mean after that write.
+// The pixel shows this frame's light. A full hemisphere counts as that many
+// rays, so the next single ray cannot wipe it out. Past 64 the count stays
+// put and new rays replace their share of the sum.
+fn deposit_light(leaf: u32, sample_l: vec3<f32>, weight: u32) -> vec3<f32> {
     if (path.voxel_light == 0u) {
         return sample_l;
     }
-    let rec = voxel_light.data[leaf];
-    let n_before = u32(rec.w);
-    if (n_before == 0u) {
-        voxel_light.data[leaf] = vec4<f32>(sample_l, 1.0);
-        let shared = sibling_light(leaf);
-        if (shared.w > 0.0) {
-            return shared.xyz;
-        }
-        return sample_l;
+    seed_prior(leaf);
+    let before = load_light(leaf);
+    let prev = u32(before.w);
+    var take = weight;
+    if (take < 1u) {
+        take = 1u;
     }
-    var n = n_before;
-    var mean = rec.xyz;
-    if (n > 64u) {
-        n = 64u;
+    if (prev >= LIGHT_CAP) {
+        let w = f32(min(take, LIGHT_CAP));
+        let updated = before.xyz + (sample_l - before.xyz) * (w / f32(LIGHT_CAP));
+        add_rad(leaf, (sample_l - before.xyz) * w);
+        store_count(leaf, prev);
+        return updated;
     }
-    if (n < 64u) {
-        n = n + 1u;
-        mean = mean + (sample_l - mean) / f32(n);
-    } else {
-        mean = mean + (sample_l - mean) * (1.0 / 64.0);
+    let room = LIGHT_CAP - prev;
+    if (take > room) {
+        take = room;
     }
-    voxel_light.data[leaf] = vec4<f32>(mean, f32(n));
+    var updated = sample_l;
+    if (prev > 0u) {
+        updated = (before.xyz * f32(prev) + sample_l * f32(take)) / f32(prev + take);
+    }
+    add_rad(leaf, sample_l * f32(take));
+    store_count(leaf, prev + take);
+    return updated;
+}
+
+fn indirect_of(leaf: u32) -> vec3<f32> {
+    let own = load_light(leaf);
+    if (own.w > 0.0) {
+        return own.xyz;
+    }
     let shared = sibling_light(leaf);
     if (shared.w > 0.0) {
         return shared.xyz;
     }
-    return rec.xyz;
+    return vec3<f32>(0.0);
 }
 
-// One bounce, read only. The four probes that feed a deposit must not write,
-// or they would race each other on the next leaf.
+// One bounce. The sun is traced for this hit and returned to the receiver,
+// which is what stores it as that receiver's indirect. It is not written
+// onto the surface it landed on, or the next reader would add the sun twice.
+// An empty leaf still takes its siblings' indirect so the bounce is not black.
 fn sample_bounce(ray: Ray) -> vec3<f32> {
     let hit = scene_ray(ray, false);
     if (!hit.hit) {
@@ -695,19 +823,37 @@ fn sample_bounce(ray: Ray) -> vec3<f32> {
     }
     let diffuse_albedo = hit.albedo * (1.0 - hit.metal);
     let emitted = hit.albedo * (hit.emission * path.texture_emission);
-    if (hit.leaf != 4294967295u) {
-        let shared = sibling_light(hit.leaf);
-        if (shared.w > 0.0) {
-            return emitted + diffuse_albedo * shared.xyz;
-        }
-    }
     let sun_direction = normalize(-u.sun_dir.xyz);
     let n_dot_l = max(dot(hit.shade, sun_direction), 0.0);
     var direct_l = vec3<f32>(0.0);
-    if (n_dot_l > 0.0 && sun_visible(hit.pos, hit.normal, sun_direction)) {
-        direct_l = vec3<f32>(2.4, 2.25, 2.0) * n_dot_l;
+    var sun_known = false;
+    var sun_lit = false;
+    if (hit.leaf != 4294967295u) {
+        let meta = light_meta(hit.leaf);
+        if ((meta & SUN_VALID) != 0u) {
+            sun_known = true;
+            sun_lit = (meta & SUN_LIT) != 0u;
+        }
     }
-    return emitted + diffuse_albedo * direct_l;
+    if (n_dot_l > 0.0) {
+        if (!sun_known) {
+            sun_lit = sun_visible(hit.pos, hit.normal, sun_direction);
+            if (hit.leaf != 4294967295u) {
+                note_sun(hit.leaf, sun_lit);
+            }
+        }
+        if (sun_lit) {
+            direct_l = vec3<f32>(2.4, 2.25, 2.0) * n_dot_l;
+        }
+    }
+    var indirect = vec3<f32>(0.0);
+    if (hit.leaf != 4294967295u) {
+        if (light_count(hit.leaf) == 0u) {
+            seed_prior(hit.leaf);
+        }
+        indirect = indirect_of(hit.leaf);
+    }
+    return emitted + diffuse_albedo * (direct_l + indirect);
 }
 
 // The bounce budget ends by reading the next surface instead of dropping that
@@ -733,7 +879,7 @@ fn terminal_radiance(ray: Ray) -> vec3<f32> {
         direct_l = vec3<f32>(2.4, 2.25, 2.0) * n_dot_l;
     }
     if (hit.leaf != 4294967295u && luminance(diffuse_albedo) > 0.001) {
-        deposit_light(hit.leaf, direct_l);
+        deposit_light(hit.leaf, direct_l, 1u);
     }
     return emitted + diffuse_albedo * direct_l;
 }
@@ -752,6 +898,8 @@ fn trace_path(camera_pos: vec3<f32>, camera_dir: vec3<f32>, seed: u32, gather: b
     var incoming = vec3<f32>(0.0);
     var count = 0u;
     var bounce = 0u;
+    // Probes a settled leaf does not spend are used on the next young leaf.
+    var probe_spare = 0u;
 
     loop {
         // max_bounces is the number of bounces after the camera hit. 1 traces
@@ -793,7 +941,9 @@ fn trace_path(camera_pos: vec3<f32>, camera_dir: vec3<f32>, seed: u32, gather: b
         let sun_rgb = vec3<f32>(2.4, 2.25, 2.0);
         var direct_l = vec3<f32>(0.0);
         var spec_emit = emitted;
+        var sun_lit = false;
         if (n_dot_l > 0.0 && sun_visible(hit.pos, hit.normal, sun_direction)) {
+            sun_lit = true;
             let half_sun = normalize(view + sun_direction);
             let n_dot_h = max(dot(shade_n, half_sun), 0.0);
             let fresnel = fresnel_schlick(max(dot(view, half_sun), 0.0), f0);
@@ -810,6 +960,9 @@ fn trace_path(camera_pos: vec3<f32>, camera_dir: vec3<f32>, seed: u32, gather: b
             direct_l = sun_rgb * n_dot_l * sun_scale;
             spec_emit = emitted + spec_sun * sun_scale;
         }
+        if (path.voxel_light != 0u && hit.leaf != 4294967295u && n_dot_l > 0.0) {
+            note_sun(hit.leaf, sun_lit);
+        }
 
         light_leaf[bounce] = hit.leaf;
         light_has[bounce] = u32(hit.leaf != 4294967295u);
@@ -817,6 +970,7 @@ fn trace_path(camera_pos: vec3<f32>, camera_dir: vec3<f32>, seed: u32, gather: b
         light_emit[bounce] = spec_emit;
         light_albedo[bounce] = diffuse_albedo;
         light_added[bounce] = vec3<f32>(0.0);
+        light_probed[bounce] = 0u;
 
         // Lighting scale 2 keeps one pixel of each 2x2, scale 3 one of each 3x3.
         // The other pixels still find the surface and read the stored light.
@@ -850,30 +1004,67 @@ fn trace_path(camera_pos: vec3<f32>, camera_dir: vec3<f32>, seed: u32, gather: b
             spec_w = clamp(weight, vec3<f32>(0.0), vec3<f32>(4.0)) / p_spec;
             throughput = throughput * spec_w;
         } else {
-            next_dir = cosine_from_blue(shade_n, bounce, 1u, blue_disk(pixel, bounce, 0u));
+            var leaf_n = 0u;
+            if (path.voxel_light != 0u && hit.leaf != 4294967295u) {
+                leaf_n = light_count(hit.leaf);
+            }
+            next_dir = disk_sample(shade_n, leaf_n, blue_disk(pixel, bounce, 0u));
             if (dot(next_dir, hit.normal) <= 0.05) {
-                next_dir = cosine_from_blue(shade_n, bounce, 1u, blue_disk(pixel, bounce, 3u));
+                next_dir = disk_sample(shade_n, leaf_n + 32u, blue_disk(pixel, bounce, 3u));
             }
             indirect_scale = 1.0 / max(1.0 - p_spec, 0.001);
             throughput = throughput * diffuse_albedo * indirect_scale;
             // The extra rays would be thrown away if each one stored itself,
             // so they are averaged in the pixel and written once.
             if (path.voxel_light != 0u) {
-                let samples = max(path.light_samples, 1u);
-                var probe_sum = vec3<f32>(0.0);
-                var s = 0u;
-                loop {
-                    if (s >= samples) { break; }
-                    let rg = blue_disk(pixel, bounce * 8u + s, 1u);
-                    var probe_dir = cosine_from_blue(shade_n, s, samples, rg);
-                    if (dot(probe_dir, hit.normal) <= 0.05) {
-                        probe_dir = cosine_from_blue(shade_n, s, samples, blue_disk(pixel, bounce * 8u + s, 4u));
-                    }
-                    let origin = hit.pos + hit.normal * 0.000004 + probe_dir * 0.000004;
-                    probe_sum = probe_sum + sample_bounce(Ray(origin, probe_dir));
-                    s = s + 1u;
+                var already = false;
+                if (hit.leaf != 4294967295u) {
+                    already = seen_this_frame(hit.leaf);
                 }
-                light_added[bounce] = probe_sum * (indirect_scale / f32(samples));
+                // The first bounce fills the hemisphere. A later bounce reads
+                // the cache with one ray. A leaf another pixel already wrote
+                // this frame just keeps that mean.
+                if (!already && bounce == 0u) {
+                    if (hit.leaf != 4294967295u) {
+                        touch_frame(hit.leaf);
+                    }
+                    var samples = max(path.light_samples, 1u);
+                    // A new leaf spends its whole budget on one hemisphere.
+                    // Sixteen cosine rays are enough for the first picture.
+                    if (leaf_n < 16u) {
+                        samples = max(samples, 16u);
+                    } else if (leaf_n >= 48u) {
+                        if (samples > 1u) {
+                            probe_spare = probe_spare + (samples - 1u);
+                        }
+                        samples = 1u;
+                    } else if (probe_spare > 0u) {
+                        samples = min(16u, samples + probe_spare);
+                        probe_spare = 0u;
+                    }
+                    var probe_sum = vec3<f32>(0.0);
+                    var s = 0u;
+                    loop {
+                        if (s >= samples) { break; }
+                        let seq = leaf_n * 8u + s;
+                        var probe_dir = disk_sample(shade_n, seq, blue_disk(pixel, bounce * 8u + s, 1u));
+                        if (dot(probe_dir, hit.normal) <= 0.05) {
+                            probe_dir = disk_sample(shade_n, seq + 32u, blue_disk(pixel, bounce * 8u + s, 4u));
+                        }
+                        let origin = hit.pos + hit.normal * 0.000004 + probe_dir * 0.000004;
+                        probe_sum = probe_sum + sample_bounce(Ray(origin, probe_dir));
+                        s = s + 1u;
+                    }
+                    light_added[bounce] = probe_sum * (indirect_scale / f32(samples));
+                    light_probed[bounce] = samples;
+                } else if (!already) {
+                    if (hit.leaf != 4294967295u) {
+                        touch_frame(hit.leaf);
+                    }
+                    let origin = hit.pos + hit.normal * 0.000004 + next_dir * 0.000004;
+                    light_added[bounce] = sample_bounce(Ray(origin, next_dir)) * indirect_scale;
+                    light_probed[bounce] = 1u;
+                }
             }
         }
         if (bounce >= 2u) {
@@ -915,14 +1106,24 @@ fn trace_path(camera_pos: vec3<f32>, camera_dir: vec3<f32>, seed: u32, gather: b
         count = count - 1u;
         var lit = light_direct[count];
         if (path.voxel_light != 0u) {
-            lit = lit + light_added[count];
+            // The cache is indirect only. This hit's sun stays in light_direct
+            // so a shadow stays as sharp as the leaf that cast it.
+            var indirect = vec3<f32>(0.0);
+            if (light_has[count] != 0u && luminance(light_albedo[count]) > 0.001) {
+                if (gather && light_probed[count] != 0u) {
+                    indirect = deposit_light(light_leaf[count], light_added[count], light_probed[count]);
+                } else {
+                    indirect = indirect_of(light_leaf[count]);
+                }
+            }
+            lit = light_direct[count] + indirect;
         } else if (light_indirect[count] > 0.0) {
             lit = lit + li * light_indirect[count];
         }
         var diffuse_out = light_albedo[count] * lit;
-        if (light_has[count] != 0u && luminance(light_albedo[count]) > 0.001) {
+        if (path.voxel_light == 0u && light_has[count] != 0u && luminance(light_albedo[count]) > 0.001) {
             if (gather) {
-                diffuse_out = light_albedo[count] * deposit_light(light_leaf[count], lit);
+                diffuse_out = light_albedo[count] * deposit_light(light_leaf[count], lit, 1u);
             } else {
                 let leaf = light_leaf[count];
                 let shared = sibling_light(leaf);
